@@ -1,16 +1,13 @@
-import ToolCard from '../components/ToolCard';
-import ScanResultsTable from '../components/ScanResultsTable';
-import SummaryCharts from '../components/SummaryCharts';
-import { getDictionary } from '../lib/i18n';
+import ToolCard from '@/components/ToolCard';
+import ScanResultsTable from '@/components/ScanResultsTable';
+import SummaryCharts from '@/components/SummaryCharts';
 
-const dict = getDictionary('en');
-
-export default function HomePage() {
+export default function DashboardPage() {
   return (
     <main className="p-4 space-y-8">
-      <h1 className="text-3xl font-bold">{dict.dashboard}</h1>
+      <h1 className="text-3xl font-bold">Dashboard</h1>
       <section>
-        <h2 className="text-2xl font-semibold mb-4">{dict.tools}</h2>
+        <h2 className="text-2xl font-semibold mb-4">Tools</h2>
         <div className="grid gap-4 grid-cols-1 md:grid-cols-2 lg:grid-cols-4">
           <ToolCard tool="nmap" title="Nmap" description="Network scanning" />
           <ToolCard tool="sqlmap" title="SQLMap" description="SQL injection detection" />
@@ -19,11 +16,11 @@ export default function HomePage() {
         </div>
       </section>
       <section>
-        <h2 className="text-2xl font-semibold mb-4">{dict.recentScanResults}</h2>
+        <h2 className="text-2xl font-semibold mb-4">Recent Scans</h2>
         <ScanResultsTable />
       </section>
       <section>
-        <h2 className="text-2xl font-semibold mb-4">{dict.summary}</h2>
+        <h2 className="text-2xl font-semibold mb-4">Summary</h2>
         <SummaryCharts />
       </section>
     </main>

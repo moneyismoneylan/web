@@ -1,0 +1,20 @@
+{
+  "1": {
+    "id": "1",
+    "tool": "nmap",
+    "target": "example.com",
+    "status": "completed",
+    "startedAt": "2024-01-01T00:00:00Z",
+    "finishedAt": "2024-01-01T00:05:00Z",
+    "output": { "openPorts": [80, 443] }
+  },
+  "2": {
+    "id": "2",
+    "tool": "sqlmap",
+    "target": "example.org",
+    "status": "running",
+    "startedAt": "2024-01-02T12:00:00Z",
+    "finishedAt": "",
+    "output": {}
+  }
+}

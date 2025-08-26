@@ -2,47 +2,43 @@
 
 import {
   Chart,
-  LineElement,
-  PointElement,
+  BarElement,
   CategoryScale,
   LinearScale,
   ArcElement,
   Tooltip,
   Legend,
 } from 'chart.js';
-import { Line, Doughnut } from 'react-chartjs-2';
+import { Bar, Doughnut } from 'react-chartjs-2';
+import { useSummary } from '@/lib/api';
 
-Chart.register(LineElement, PointElement, CategoryScale, LinearScale, ArcElement, Tooltip, Legend);
+Chart.register(BarElement, CategoryScale, LinearScale, ArcElement, Tooltip, Legend);
 
 export default function SummaryCharts() {
-  const lineData = {
-    labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul'],
+  const { data, isLoading, error } = useSummary();
+  if (isLoading) return <p>Loading...</p>;
+  if (error || !data) return <p>Error loading summary</p>;
+
+  const barData = {
+    labels: Object.keys(data.byTool),
     datasets: [
       {
-        label: 'Completed',
-        data: [12, 19, 15, 17, 22, 25, 30],
-        borderColor: 'rgb(25, 135, 84)',
-        backgroundColor: 'rgba(25, 135, 84, 0.2)',
-      },
-      {
-        label: 'Running',
-        data: [5, 8, 6, 9, 7, 10, 8],
-        borderColor: 'rgb(13, 110, 253)',
-        backgroundColor: 'rgba(13, 110, 253, 0.2)',
+        label: 'Scans by Tool',
+        data: Object.values(data.byTool),
+        backgroundColor: 'rgba(13,110,253,0.5)',
       },
     ],
   };
 
   const doughnutData = {
-    labels: ['Critical', 'High', 'Medium', 'Low'],
+    labels: ['Completed', 'Running', 'Failed'],
     datasets: [
       {
-        data: [3, 7, 12, 8],
+        data: [data.completed, data.running, data.failed],
         backgroundColor: [
-          'rgb(220, 53, 69)',
-          'rgb(255, 193, 7)',
-          'rgb(13, 202, 240)',
-          'rgb(25, 135, 84)',
+          'rgb(25,135,84)',
+          'rgb(13,110,253)',
+          'rgb(220,53,69)',
         ],
       },
     ],
@@ -50,10 +46,9 @@ export default function SummaryCharts() {
 
   return (
     <div className="grid gap-8 md:grid-cols-2">
-      <Line
-        data={lineData}
+      <Bar
+        data={barData}
         options={{
-          responsive: true,
           plugins: { legend: { labels: { color: '#fff' } } },
           scales: {
             x: { ticks: { color: '#fff' }, grid: { color: 'rgba(255,255,255,0.1)' } },
