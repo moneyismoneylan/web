@@ -8,6 +8,10 @@ vi.mock('react-chartjs-2', () => ({
   Doughnut: () => <div data-testid="doughnut-chart" />,
 }));
 
+vi.mock('@tanstack/react-query-devtools', () => ({
+  ReactQueryDevtools: () => null,
+}));
+
 vi.mock('../../lib/api', () => ({
   useScans: () => ({
     data: [
