@@ -1,0 +1,12 @@
+{
+  "total": 2,
+  "completed": 1,
+  "running": 1,
+  "failed": 0,
+  "byTool": {
+    "nmap": 1,
+    "sqlmap": 1,
+    "osint": 0,
+    "web": 0
+  }
+}

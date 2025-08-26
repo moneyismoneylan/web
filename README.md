@@ -8,7 +8,7 @@ A Next.js + TypeScript implementation of a cybersecurity tools dashboard. It sho
 - Recent scan results table
 - Summary charts built with Chart.js
 
-See [docs/PROMISES_TO_FEATURES.md](docs/PROMISES_TO_FEATURES.md) for the mapping of promises to implemented features.
+See [docs/PROMISES_TO_FEATURES.md](docs/PROMISES_TO_FEATURES.md) for the mapping of promises to implemented features. Architectural trade-offs are captured in [docs/DECISIONS.md](docs/DECISIONS.md).
 
 ## Getting Started
 
