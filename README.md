@@ -15,6 +15,7 @@ See [docs/PROMISES_TO_FEATURES.md](docs/PROMISES_TO_FEATURES.md) for the mapping
 ### Prerequisites
 - Node.js 20
 - pnpm
+- (for live scanning) system tools: `nmap`, `sqlmap`, `whois`, `curl`
 
 ### Installation
 ```sh
