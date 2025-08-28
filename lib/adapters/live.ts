@@ -83,13 +83,16 @@ export class LiveProvider implements Provider {
   ): string {
     switch (tool) {
       case 'nmap':
-        return `nmap ${target}`;
+        // -Pn treats targets as online even if they ignore ping probes
+        return `nmap -Pn ${target}`;
       case 'sqlmap':
-        return `sqlmap -u ${target} --batch`;
+        // minimal flags for non-interactive runs
+        return `sqlmap -u ${target} --batch --crawl=0 --level=1 --risk=1`;
       case 'osint':
         return `whois ${target}`;
       case 'web':
-        return `curl -I ${target}`;
+        // follow redirects and fetch headers
+        return `curl -L -I ${target}`;
       default:
         return `echo unknown tool`;
     }

@@ -16,6 +16,8 @@ See [docs/PROMISES_TO_FEATURES.md](docs/PROMISES_TO_FEATURES.md) for the mapping
 - Node.js 20
 - pnpm
 - (for live scanning) system tools: `nmap`, `sqlmap`, `whois`, `curl`
+  - install on Debian/Ubuntu via `apt-get install nmap sqlmap`
+  - set `USE_MOCKS=false` to enable live scans
 
 ### Installation
 ```sh
