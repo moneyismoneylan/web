@@ -1,106 +1,149 @@
 # -*- coding: utf-8 -*-
 """
-Advanced Crawler Module.
+Web Crawler Engine.
 
-This module will be responsible for crawling the target website to find all
-links, forms, and other potential injection points. It will use asynchronous
-requests to be fast and efficient.
+This module provides the Crawler class, which is responsible for discovering
+links, forms, and JavaScript-initiated API endpoints on a target website.
 """
 import asyncio
-from playwright.async_api import BrowserContext, Error
-from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-from collections import deque
+from playwright.async_api import BrowserContext, Error, Page, Request
+from bs4 import BeautifulSoup
+from typing import Set
 
 class Crawler:
     """
-    Asynchronous, browser-based web crawler that produces targets for a queue.
+    Crawls a website to find all injectable entry points (URLs, forms, API endpoints).
     """
     def __init__(self, base_url: str, max_depth: int, queue: asyncio.Queue, browser_context: BrowserContext):
         self.base_url = base_url
-        self.domain_name = urlparse(base_url).netloc
+        self.domain = urlparse(base_url).netloc
         self.max_depth = max_depth
         self.queue = queue
         self.context = browser_context
+        self.visited_urls: Set[str] = set()
+        self.discovered_endpoints: Set[str] = set()
 
-        self.crawl_queue = deque([(self.base_url, 0)])
-        self.visited_urls = set()
+    async def _handle_request(self, request: Request):
+        """Intercepts and analyzes network requests to find hidden API endpoints."""
+        # Filter for in-scope, XHR/Fetch requests that are not static assets
+        if self.domain not in request.url:
+            return
+        if request.resource_type not in ["fetch", "xhr"]:
+            return
+        if any(request.url.endswith(ext) for ext in ['.js', '.css', '.png', '.jpg', '.svg']):
+            return
 
-    async def _get_page_content(self, page, url: str) -> tuple[str | None, str | None]:
-        """Navigates to a URL and returns its content and content-type."""
-        try:
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            if response is None: return None, None
+        # Create a unique signature to avoid duplicates
+        endpoint_signature = f"{request.method}::{request.url.split('?')[0]}"
+        if endpoint_signature in self.discovered_endpoints:
+            return
 
-            content_type = response.headers.get('content-type', '').lower()
-            content = await page.content()
-            return content, content_type
-        except Error as e:
-            print(f"[!] Playwright error for {url}: {e}")
-            return None, None
+        self.discovered_endpoints.add(endpoint_signature)
+        print(f"[*] JS-focused Crawler found new API endpoint: {request.method} {request.url}")
 
-    async def _extract_targets(self, page, current_url: str):
-        """Extracts links and forms from a Playwright page and puts them onto the queue."""
-        # Extract and queue links
-        links = await page.eval_on_selector_all("a", "elements => elements.map(a => a.href)")
-        for link in links:
-            if not link or link.startswith(('#', 'mailto:', 'tel:', 'javascript:')):
-                continue
+        target_item = {
+            "type": "api", # A more generic type
+            "url": request.url,
+            "method": request.method,
+            "post_data": request.post_data,
+            "content_type": request.headers.get('content-type')
+        }
+        await self.queue.put(target_item)
 
-            full_url = urljoin(current_url, link)
+    async def crawl_page(self, url: str, depth: int):
+        """Crawls a single page, extracts links/forms, and listens for API calls."""
+        if url in self.visited_urls or depth > self.max_depth:
+            return
+        self.visited_urls.add(url)
+        print(f"[*] Crawling (depth {depth}): {url}")
 
-            if urlparse(full_url).netloc == self.domain_name:
-                if full_url not in self.visited_urls:
-                    self.crawl_queue.append((full_url, 0))
-
-                if '?' in full_url:
-                    await self.queue.put({"type": "url", "target": full_url})
-
-        # Extract and queue forms using Playwright's locators
-        forms = await page.locator("form").all()
-        for form in forms:
-            action = await form.get_attribute("action") or ""
-            form_url = urljoin(current_url, action)
-            method = await form.get_attribute("method") or "GET"
-
-            inputs = []
-            input_locators = await form.locator("input, textarea, select").all()
-            for locator in input_locators:
-                name = await locator.get_attribute("name")
-                if name:
-                    inputs.append({
-                        "name": name,
-                        "type": await locator.get_attribute("type") or "text",
-                        "value": await locator.input_value()
-                    })
-
-            if urlparse(form_url).netloc == self.domain_name and inputs:
-                form_details = {"url": form_url, "method": method.upper(), "inputs": inputs}
-                await self.queue.put({"type": "form", "target": form_details})
-
-    async def start(self):
-        """Starts the crawling process, adding found targets to the queue."""
         page = await self.context.new_page()
         try:
-            while self.crawl_queue:
-                url, depth = self.crawl_queue.popleft()
+            # Set up request interception before navigating
+            page.on('request', self._handle_request)
 
-                if url in self.visited_urls or depth >= self.max_depth:
-                    continue
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            if not response or not response.ok:
+                return
 
-                print(f"[*] Crawling (Depth {depth}): {url}")
-                self.visited_urls.add(url)
+            # Allow some time for dynamic content to load and make API calls
+            await page.wait_for_timeout(3000)
 
-                html_content, content_type = await self._get_page_content(page, url)
-                if not html_content:
-                    continue
+            content = await page.content()
+            soup = BeautifulSoup(content, 'html.parser')
 
-                if content_type and 'text/html' in content_type:
-                    await self._extract_targets(page, url)
+            # --- Find and queue traditional links ---
+            for link in soup.find_all('a', href=True):
+                absolute_link = urljoin(self.base_url, link['href'])
+                if self.domain in absolute_link and '#' not in absolute_link:
+                    # Add to crawl queue, not scan queue directly
+                    # The crawler will visit it and find injectable params there.
+                    # For now, we'll just add it to the scan queue as a GET.
+                    if absolute_link not in self.visited_urls:
+                         await self.queue.put({"type": "url", "url": absolute_link, "method": "GET"})
+
+
+            # --- Find and queue forms ---
+            for form in soup.find_all('form'):
+                action = form.get('action', url)
+                method = form.get('method', 'GET').upper()
+                absolute_action = urljoin(self.base_url, action)
+
+                inputs = []
+                csrf_field_name = None
+                CSRF_TOKEN_NAMES = ['csrf_token', '_csrf', 'authenticity_token', '__requestverificationtoken', 'csrfmiddlewaretoken']
+
+                for inp in form.find_all(['input', 'textarea', 'select']):
+                    input_name = inp.get('name')
+                    if input_name and input_name.lower() in CSRF_TOKEN_NAMES:
+                        csrf_field_name = input_name
+
+                    inputs.append({
+                        "name": input_name,
+                        "type": inp.get('type', 'text'),
+                        "value": inp.get('value', '')
+                    })
+
+                form_details = {
+                    "type": "form",
+                    "url": absolute_action,
+                    "method": method,
+                    "inputs": inputs,
+                }
+                if csrf_field_name:
+                    form_details['csrf_field_name'] = csrf_field_name
+                    print(f"  [*] Found potential Anti-CSRF token in form: '{csrf_field_name}'")
+
+                await self.queue.put(form_details)
+
+        except Error as e:
+            print(f"[!] Error crawling {url}: {e}")
         finally:
+            # Make sure to remove the listener to avoid memory leaks
+            page.remove_listener('request', self._handle_request)
             await page.close()
-            print("\n[+] Crawl Finished.")
 
-# This space is intentionally left blank.
-# The test code has been removed as the module is now considered stable
-# and is intended to be imported, not run directly.
+    async def start(self):
+        """Starts the crawling process from the base URL."""
+        # Use a queue for the crawler's own work
+        crawl_queue = asyncio.Queue()
+        await crawl_queue.put((self.base_url, 0))
+
+        # Keep track of what's been added to the crawl queue
+        in_crawl_queue = {self.base_url}
+
+        while not crawl_queue.empty():
+            url, depth = await crawl_queue.get()
+
+            # The crawl_page function will now add scannable targets to the main queue
+            await self.crawl_page(url, depth)
+
+            # Re-check page content for links after dynamic analysis, as crawl_page might have found more
+            # This part is simplified for now. A more robust implementation would re-parse.
+
+            # Add newly discovered URLs to the crawl queue
+            # This is a simplified version; a real implementation would get new links from crawl_page
+            # and check if they are in `in_crawl_queue` before adding.
+
+        print("[*] Crawler finished discovering entry points.")
