@@ -10,7 +10,7 @@ import json
 import random
 from simhash import Simhash
 import dns.asyncresolver
-import httpx
+from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
 from sqli_hunter.payloads import SQL_ERROR_PATTERNS, ERROR_BASED_PAYLOADS, OOB_PAYLOADS
 from sqli_hunter.tamper import apply_tampers
@@ -32,19 +32,24 @@ class Scanner:
         self.rate_limit_active = False
         self.rate_limit_delay = 1.0
         self.successful_requests_since_rl = 0
-        self.httpx_client: httpx.AsyncClient | None = None
+        self.http_session: AsyncSession | None = None
         self.payload_generator = None # Will be initialized in scan_target
         if self.static_request_delay > 0: print(f"[*] WAF policy adaptation: Applying a {self.static_request_delay}s delay between requests.")
 
-    async def _initialize_httpx_client(self):
-        if getattr(self, 'httpx_client', None) is None:
+    async def _initialize_http_session(self):
+        if getattr(self, 'http_session', None) is None:
             cookies = await self.context.cookies()
-            httpx_cookies = httpx.Cookies()
-            for cookie in cookies: httpx_cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
-            self.httpx_client = httpx.AsyncClient(cookies=httpx_cookies, follow_redirects=True, verify=False)
+            # curl_cffi expects cookies in a dict format
+            cookie_dict = {cookie['name']: cookie['value'] for cookie in cookies}
+            self.http_session = AsyncSession(
+                cookies=cookie_dict,
+                impersonate="chrome110", # Impersonate Chrome 110 to bypass TLS fingerprinting
+                allow_redirects=True,
+                verify=False
+            )
 
     async def close(self):
-        if getattr(self, 'httpx_client', None): await self.httpx_client.aclose()
+        if getattr(self, 'http_session', None): await self.http_session.close()
 
     def _update_rate_limit_status(self, status: int, is_waf_block: bool):
         is_rate_limited = status in [429, 503]
@@ -62,12 +67,24 @@ class Scanner:
     async def _send_headless_request(self, url: str, method: str = "GET", params: dict = None, data: dict = None, json_data: dict = None, timeout: int = 30) -> tuple[str | None, float, bool]:
         start_time = time.monotonic()
         try:
-            response = await self.httpx_client.request(method, url, params=params, data=data, json=json_data, timeout=timeout)
-            duration = time.monotonic() - start_time; body = response.text; status = response.status_code
+            # curl_cffi uses a different API than httpx
+            method_upper = method.upper()
+            if method_upper == "GET":
+                response = await self.http_session.get(url, params=params, timeout=timeout)
+            elif method_upper == "POST":
+                post_body = json_data if json_data is not None else data
+                response = await self.http_session.post(url, params=params, data=post_body, json=json_data, timeout=timeout)
+            else:
+                raise NotImplementedError(f"Method {method_upper} not implemented in _send_headless_request")
+
+            duration = time.monotonic() - start_time
+            body = response.text
+            status = response.status_code
             is_blocked = status in [403, 406] or any(s in body.lower() for s in ["request blocked", "forbidden", "waf"])
             self._update_rate_limit_status(status, is_blocked)
             return body, duration, is_blocked
-        except httpx.RequestError: return None, time.monotonic() - start_time, False
+        except Exception:
+            return None, time.monotonic() - start_time, False
 
     async def _send_browser_request(self, page: Page, url: str, method: str = "GET", params: dict = None, data: dict = None, json_data: dict = None, timeout: int = 30000) -> tuple[str | None, float, bool]:
         start_time = time.monotonic()
@@ -262,7 +279,7 @@ class Scanner:
         # Initialize the payload generator with the detected DB type
         self.payload_generator = AstPayloadGenerator(dialect=db_type)
 
-        await self._initialize_httpx_client()
+        await self._initialize_http_session()
         page = await self.context.new_page()
         try:
             target_type, url = target_item.get("type"), target_item.get("url")
