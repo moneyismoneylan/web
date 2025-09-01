@@ -14,37 +14,38 @@ from collections import deque
 
 class Crawler:
     """
-    Asynchronous web crawler to discover links and forms on a website.
+    Asynchronous web crawler that produces targets for a queue.
     """
-    def __init__(self, base_url: str, max_depth: int = 2):
+    def __init__(self, base_url: str, max_depth: int, queue: asyncio.Queue, client: httpx.AsyncClient):
         self.base_url = base_url
         self.domain_name = urlparse(base_url).netloc
         self.max_depth = max_depth
+        self.queue = queue
+        self.client = client
 
-        self.queue = deque([(self.base_url, 0)])
+        self.crawl_queue = deque([(self.base_url, 0)])
         self.visited_urls = set()
 
-        self.discovered_links = set()
-        self.discovered_forms = []
-
-    async def _get_page_content(self, client: httpx.AsyncClient, url: str) -> str | None:
-        """Fetches the content of a URL asynchronously."""
+    async def _get_page_content(self, url: str) -> tuple[str | None, str | None]:
+        """Fetches the content and content-type of a URL asynchronously."""
         try:
-            # Using a common user-agent
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            response = await client.get(url, follow_redirects=True, timeout=10, headers=headers)
+            response = await self.client.get(url, follow_redirects=True, timeout=10, headers=headers)
             response.raise_for_status()
-            return response.text
+            content_type = response.headers.get('content-type', '').lower()
+            return response.text, content_type
         except httpx.RequestError as e:
             print(f"[!] Request error for {e.request.url!r}: {e}")
-            return None
+            return None, None
         except httpx.HTTPStatusError as e:
             print(f"[!] HTTP error for {e.request.url!r}: Status {e.response.status_code}")
-            return None
+            return None, None
 
-    def _extract_all_links(self, html: str, current_url: str):
-        """Extracts all valid, same-domain links from HTML content."""
+    async def _extract_targets(self, html: str, current_url: str):
+        """Extracts links and forms and puts them onto the queue."""
         soup = BeautifulSoup(html, "html.parser")
+
+        # Extract and queue links
         for a_tag in soup.find_all("a", href=True):
             href = a_tag.get("href", "").strip()
             if not href or href.startswith(('#', 'mailto:', 'tel:', 'javascript:')):
@@ -53,11 +54,15 @@ class Crawler:
             full_url = urljoin(current_url, href)
 
             if urlparse(full_url).netloc == self.domain_name:
-                self.discovered_links.add(full_url)
+                # Add new links to be crawled
+                if full_url not in self.visited_urls:
+                    self.crawl_queue.append((full_url, 0)) # Depth will be handled by the main loop
 
-    def _extract_all_forms(self, html: str, current_url: str):
-        """Extracts all forms and their input fields from HTML content."""
-        soup = BeautifulSoup(html, "html.parser")
+                # Add links with parameters to the scan queue
+                if '?' in full_url:
+                    await self.queue.put({"type": "url", "target": full_url})
+
+        # Extract and queue forms
         for form in soup.find_all("form"):
             action = form.get("action", "")
             form_url = urljoin(current_url, action)
@@ -71,42 +76,31 @@ class Crawler:
                 if name:
                     inputs.append({"name": name, "type": input_type, "value": default_value})
 
-            # Only add forms that have injectable fields and are on the same domain
             if urlparse(form_url).netloc == self.domain_name and inputs:
-                self.discovered_forms.append({
-                    "url": form_url,
-                    "method": method,
-                    "inputs": inputs
-                })
+                form_details = {"url": form_url, "method": method, "inputs": inputs}
+                await self.queue.put({"type": "form", "target": form_details})
 
-    async def start_crawling(self):
-        """Starts the crawling process."""
-        async with httpx.AsyncClient() as client:
-            while self.queue:
-                url, depth = self.queue.popleft()
+    async def start(self):
+        """Starts the crawling process, adding found targets to the queue."""
+        while self.crawl_queue:
+            url, depth = self.crawl_queue.popleft()
 
-                if url in self.visited_urls or depth >= self.max_depth:
-                    continue
+            if url in self.visited_urls or depth >= self.max_depth:
+                continue
 
-                print(f"[*] Crawling (Depth {depth}): {url}")
-                self.visited_urls.add(url)
+            print(f"[*] Crawling (Depth {depth}): {url}")
+            self.visited_urls.add(url)
 
-                html_content = await self._get_page_content(client, url)
-                if not html_content:
-                    continue
+            html_content, content_type = await self._get_page_content(url)
+            if not html_content:
+                continue
 
-                self._extract_all_links(html_content, url)
-                self._extract_all_forms(html_content, url)
-
-                # Add newly discovered links to the queue
-                for link in self.discovered_links:
-                    if link not in self.visited_urls:
-                        self.queue.append((link, depth + 1))
+            # Only parse HTML content to avoid errors with binary files like PDFs/ZIPs
+            if content_type and 'text/html' in content_type:
+                # This will add new links to self.crawl_queue and new targets to self.queue
+                await self._extract_targets(html_content, url)
 
         print("\n[+] Crawl Finished.")
-        print(f"[*] Found {len(self.discovered_links)} unique links.")
-        print(f"[*] Found {len(self.discovered_forms)} forms.")
-        return list(self.discovered_links), self.discovered_forms
 
 # This space is intentionally left blank.
 # The test code has been removed as the module is now considered stable

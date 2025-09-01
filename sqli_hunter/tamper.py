@@ -20,12 +20,24 @@ def plus_url_encode(payload: str) -> str:
     """URL-encodes the payload, replacing spaces with '+'."""
     return quote_plus(payload)
 
+from urllib.parse import quote
+
+def char_double_encode(payload: str) -> str:
+    """Double-URL-encodes all characters."""
+    return "".join(f"%{ord(c):02x}" for c in quote(payload, safe=""))
+
+def equal_to_like(payload: str) -> str:
+    """Replaces all instances of '=' with ' LIKE '."""
+    return payload.replace("=", " LIKE ")
+
 # A dictionary to map tamper script names to their respective functions.
 # This makes the tamper engine easily extensible.
 TAMPER_FUNCTIONS = {
     'space2comment': space_to_comment,
     'randomcase': random_case,
     'urlencode': plus_url_encode,
+    'chardoubleencode': char_double_encode,
+    'equaltolike': equal_to_like,
 }
 
 def apply_tampers(payload: str, tamper_list: list[str]) -> str:
