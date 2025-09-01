@@ -13,7 +13,8 @@ import re
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import time
-from sqli_hunter.payloads import SQL_ERROR_PATTERNS, ERROR_BASED_PAYLOADS, BOOLEAN_BASED_PAYLOADS, TIME_BASED_PAYLOADS, OOB_PAYLOADS
+import base64
+from sqli_hunter.payloads import SQL_ERROR_PATTERNS, ERROR_BASED_PAYLOADS, BOOLEAN_BASED_PAYLOADS, TIME_BASED_PAYLOADS, OOB_PAYLOADS, EXTRACTION_PAYLOADS_B64, EXTRACTION_QUERIES_B64
 from sqli_hunter.tamper import apply_tampers, get_tampers_for_waf
 from sqli_hunter.waf_detector import WafDetector
 
@@ -182,36 +183,82 @@ class Scanner:
                     pass
         return
 
-    async def scan(self, base_url: str, target_urls: list[str], collaborator_url: str | None = None):
+    async def scan_target(self, target_item: dict, tampers: list[str], collaborator_url: str | None = None):
         """
-        Orchestrates the entire scan process for a given list of target URLs.
+        Scans a single target (URL or form) from the queue.
         """
-        print("--- Starting Scan ---")
-        waf_name = await self.waf_detector.check_waf(base_url)
-        tampers_to_use = get_tampers_for_waf(waf_name)
+        target_type = target_item.get("type")
+        target_data = target_item.get("target")
 
-        print(f"[*] Starting scan on {len(target_urls)} potential injection points.")
+        if not target_type or not target_data:
+            return
 
-        for url in target_urls:
-            # Check if vulnerability is already found for this specific URL to avoid redundant checks
-            if any(p['url'].split('?')[0] == url.split('?')[0] for p in self.vulnerable_points):
-                print(f"[*] Skipping {url} as a vulnerability has already been found on this page.")
-                continue
+        # Simple check to avoid re-scanning the same base URL/form action
+        # A more robust check might be needed for complex cases
+        scan_identifier = target_data if target_type == "url" else target_data["url"]
+        if any(p['url'].split('?')[0] == scan_identifier.split('?')[0] for p in self.vulnerable_points):
+            print(f"[*] Skipping {scan_identifier} as a vulnerability has already been found on this page/form action.")
+            return
 
-            await self._scan_point_for_error_based_sqli(url, tampers_to_use)
-            # If error-based is found, no need to check for blind spots on the same URL
-            if any(p['url'].split('?')[0] == url.split('?')[0] for p in self.vulnerable_points):
-                continue
-
-            await self._scan_point_for_boolean_based_sqli(url, tampers_to_use)
-            await self._scan_point_for_time_based_sqli(url, tampers_to_use)
+        if target_type == "url":
+            await self._scan_point_for_error_based_sqli(target_data, tampers)
+            if any(p['url'].split('?')[0] == scan_identifier.split('?')[0] for p in self.vulnerable_points):
+                return
+            await self._scan_point_for_boolean_based_sqli(target_data, tampers)
+            await self._scan_point_for_time_based_sqli(target_data, tampers)
             if collaborator_url:
-                await self._scan_point_for_oob_sqli(url, tampers_to_use, collaborator_url)
+                await self._scan_point_for_oob_sqli(target_data, tampers, collaborator_url)
 
-        print("--- Scan Finished ---")
+        elif target_type == "form":
+            await self._scan_form_for_error_based_sqli(target_data, tampers)
+            # TODO: Add boolean, time-based, and OOB scanning for forms as well.
         if self.vulnerable_points:
             print(f"\n[!!!] Found {len(self.vulnerable_points)} vulnerabilities.")
         else:
             print("\n[-] No vulnerabilities found.")
+
+    async def _scan_form_for_error_based_sqli(self, form_details: dict, tampers: list[str]):
+        """
+        Tests a single HTML form for error-based SQLi.
+        """
+        url = form_details["url"]
+        method = form_details["method"].upper()
+        inputs = form_details["inputs"]
+
+        print(f"[*] Testing Form for Error-Based SQLi on: {url} ({method})")
+
+        # Iterate over each input field to inject payloads
+        for input_to_test in inputs:
+            # Skip non-text-like inputs
+            if input_to_test.get("type") not in ["text", "textarea", "password", "email", "search", "url", "tel"]:
+                continue
+
+            for payload in ERROR_BASED_PAYLOADS:
+                # Prepare form data, injecting the payload into the field under test
+                data = {}
+                for inp in inputs:
+                    if inp["name"] == input_to_test["name"]:
+                        data[inp["name"]] = inp.get("value", "") + payload
+                    else:
+                        data[inp["name"]] = inp.get("value", "")
+
+                tampered_payload = apply_tampers(str(data[input_to_test["name"]]), tampers)
+                data[input_to_test["name"]] = tampered_payload
+
+                try:
+                    if method == "POST":
+                        response = await self.client.post(url, data=data, timeout=10)
+                    else: # GET
+                        response = await self.client.get(url, params=data, timeout=10)
+
+                    error_found = self._check_for_sql_errors(response.text)
+                    if error_found:
+                        vuln_info = {"url": url, "type": "Error-Based SQLi (FORM)", "parameter": input_to_test["name"], "payload": tampered_payload, "error": error_found}
+                        print(f"[+] Vulnerability Found: {vuln_info}")
+                        self.vulnerable_points.append(vuln_info)
+                        return # Move to the next form once a vulnerability is found
+                except httpx.RequestError as e:
+                    print(f"[!] Request failed for form at {url}: {e}")
+        return
 
 # Test code has been removed. This module is intended to be imported.
