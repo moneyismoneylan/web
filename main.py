@@ -7,6 +7,7 @@ import asyncio
 import json
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright
+from playwright_stealth.stealth import Stealth
 from rich.console import Console
 from rich.table import Table
 import dns.asyncresolver
@@ -72,9 +73,16 @@ async def main():
     if not urlparse(args.url).scheme: args.url = "http://" + args.url
     console.print(f"[bold green][*] Target URL:[/] [link={args.url}]{args.url}[/link]")
 
-    async with async_playwright() as p:
+    async with Stealth().use_async(async_playwright()) as p:
         browser = await p.chromium.launch()
-        context = await browser.new_context()
+        # Use a common User-Agent and other properties to avoid simple bot detection
+        # Note: The stealth plugin may override some of these, but we set them as a baseline.
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.51 Safari/537.36",
+            viewport={'width': 1920, 'height': 1080},
+            locale='en-US',
+            timezone_id='America/New_York'
+        )
         if args.cookie:
             try:
                 name, value = args.cookie.split('=', 1)
