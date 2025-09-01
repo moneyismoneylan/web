@@ -4,7 +4,6 @@ from playwright.async_api import BrowserContext, Page, Error
 import re
 from urllib.parse import urlparse, parse_qs, urljoin
 import time
-import base64
 import statistics
 import uuid
 import json
@@ -13,17 +12,13 @@ from simhash import Simhash
 import dns.asyncresolver
 import httpx
 from bs4 import BeautifulSoup
-from sqli_hunter.payloads import SQL_ERROR_PATTERNS, ERROR_BASED_PAYLOADS, BOOLEAN_BASED_PAYLOADS, TIME_BASED_PAYLOADS, OOB_PAYLOADS
-from sqli_hunter.tamper import apply_tampers, TamperSelector
-from sqli_hunter.polymorphic_engine import PolymorphicEngine
+from sqli_hunter.payloads import SQL_ERROR_PATTERNS, ERROR_BASED_PAYLOADS, OOB_PAYLOADS
+from sqli_hunter.tamper import apply_tampers
+from sqli_hunter.ast_payload_generator import AstPayloadGenerator
+from sqli_hunter.bayesian_tamper_optimizer import BayesianTamperOptimizer
 from typing import Callable, Awaitable, Any, Tuple, List, Set, Dict
-from collections import defaultdict
 
 WAF_TEMPO_MAP = { "Cloudflare": 1.5, "AWS WAF": 0.5, "Imperva (Incapsula)": 1.0 }
-CONTEXT_PAYLOAD_PREFIX = {
-    "HTML_ATTRIBUTE_SINGLE_QUOTED": "'", "HTML_ATTRIBUTE_DOUBLE_QUOTED": "\"",
-    "JS_STRING_SINGLE_QUOTED": "'", "JS_STRING_DOUBLE_QUOTED": "\"",
-}
 MAX_BACKOFF_DELAY = 60.0
 
 class Scanner:
@@ -31,15 +26,14 @@ class Scanner:
         self.context = browser_context
         self.vulnerable_points = []
         self.lock = asyncio.Lock()
-        self.polymorphic_engine = PolymorphicEngine()
         self.dns_resolver = dns.asyncresolver.Resolver()
-        self.tamper_selector = TamperSelector(waf_name=waf_name)
         self.canary_store = canary_store
         self.static_request_delay = WAF_TEMPO_MAP.get(waf_name, 0)
         self.rate_limit_active = False
         self.rate_limit_delay = 1.0
         self.successful_requests_since_rl = 0
         self.httpx_client: httpx.AsyncClient | None = None
+        self.payload_generator = None # Will be initialized in scan_target
         if self.static_request_delay > 0: print(f"[*] WAF policy adaptation: Applying a {self.static_request_delay}s delay between requests.")
 
     async def _initialize_httpx_client(self):
@@ -78,12 +72,25 @@ class Scanner:
     async def _send_browser_request(self, page: Page, url: str, method: str = "GET", params: dict = None, data: dict = None, json_data: dict = None, timeout: int = 30000) -> tuple[str | None, float, bool]:
         start_time = time.monotonic()
         try:
-            response = await page.request.request(url, method=method, params=params, data=data, json=json_data, timeout=timeout)
-            duration = time.monotonic() - start_time; body = await response.text(); status = response.status
+            method_upper = method.upper()
+            if method_upper == "GET":
+                response = await page.request.get(url, params=params, timeout=timeout)
+            elif method_upper == "POST":
+                # Note: Playwright's APIRequestContext handles 'data' and 'json' automatically based on content-type headers
+                # or the type of the passed object. We pass both if they exist.
+                response = await page.request.post(url, params=params, data=data, json=json_data, timeout=timeout)
+            else:
+                raise NotImplementedError(f"Method {method} not implemented in _send_browser_request")
+
+            duration = time.monotonic() - start_time
+            body = await response.text()
+            status = response.status
             is_blocked = status in [403, 406] or any(s in body.lower() for s in ["request blocked", "forbidden", "waf"])
             self._update_rate_limit_status(status, is_blocked)
             return body, duration, is_blocked
-        except Error: return None, time.monotonic() - start_time, False
+        except Error as e:
+            print(f"  [DEBUG] Playwright error in browser request: {e}")
+            return None, time.monotonic() - start_time, False
 
     async def _get_baseline(self, page: Page, url: str, method: str, params: dict = None, data: dict = None, json_data: dict = None) -> tuple[float, Simhash | None]:
         timings, content_for_hash = [], None
@@ -94,34 +101,27 @@ class Scanner:
         if not timings: return 0.0, None
         return statistics.median(timings), Simhash(content_for_hash) if content_for_hash else None
 
-    async def _perform_taint_analysis(self, page: Page, url: str, method: str, create_request_args: Callable) -> Set[str]:
+    async def _perform_taint_analysis(self, page: Page, url: str, method: str, create_request_args: Callable) -> str:
         taint = "sqlihunter" + uuid.uuid4().hex[:8]
-        request_args = create_request_args(taint)
+        request_args = await create_request_args(taint)
         body, _, is_blocked = await self._send_browser_request(page, url, method, **request_args)
-        if is_blocked or not body or taint not in body: return set()
-        contexts = set()
-        if re.search(f"'[^>]*{taint}[^>]*'", body, re.IGNORECASE): contexts.update(["HTML_ATTRIBUTE_SINGLE_QUOTED", "JS_STRING_SINGLE_QUOTED"])
-        if re.search(f'"[^>]*{taint}[^>]*"', body, re.IGNORECASE): contexts.update(["HTML_ATTRIBUTE_DOUBLE_QUOTED", "JS_STRING_DOUBLE_QUOTED"])
-        if re.search(f">(?!'|\")[^<]*{taint}[^<]*<", body, re.IGNORECASE): contexts.add("HTML_TEXT")
-        if contexts: print(f"  [*] Taint Analysis found reflection contexts: {list(contexts)}")
-        return contexts
+        if is_blocked or not body or taint not in body: return "HTML_TEXT" # Default context
+
+        if re.search(f"'[^>]*{taint}[^>]*'", body, re.IGNORECASE): return "HTML_ATTRIBUTE_SINGLE_QUOTED"
+        if re.search(f'"[^>]*{taint}[^>]*"', body, re.IGNORECASE): return "HTML_ATTRIBUTE_DOUBLE_QUOTED"
+        # More specific JS checks could be added here
+        if re.search(f">(?!'|\")[^<]*{taint}[^<]*<", body, re.IGNORECASE): return "HTML_TEXT"
+
+        return "HTML_TEXT" # Default fallback
 
     async def _check_oast_interaction(self, domain: str) -> bool:
         await asyncio.sleep(2);
         try: await self.dns_resolver.resolve(domain, 'A'); return True
         except Exception: return False
 
-    async def _scan_oast(self, payloads: List, sender_func: Callable, collaborator_url: str) -> Tuple[str | None, tuple | None]:
-        if not collaborator_url: return None, None
-        for payload_template in payloads:
-            oast_id = uuid.uuid4().hex[:12]; oast_domain = f"{oast_id}.{collaborator_url}"
-            payload = payload_template.format(collaborator_url=oast_domain)
-            _, _, _, chain = await sender_func(payload)
-            if await self._check_oast_interaction(oast_domain): return payload, chain
-        return None, None
-
-    async def _scan_boolean_based(self, payloads: List, sender_func: Callable, baseline_hash: Simhash) -> Tuple[str | None, tuple | None]:
+    async def _scan_boolean_based(self, sender_func: Callable, baseline_hash: Simhash, context: str) -> Tuple[str | None, tuple | None]:
         if not baseline_hash: return None, None
+        payloads = self.payload_generator.generate("BOOLEAN_BASED", context)
         for true_payload, false_payload, _ in payloads:
             true_content, _, is_blocked_true, chain_true = await sender_func(true_payload)
             if is_blocked_true or not true_content: continue
@@ -131,64 +131,87 @@ class Scanner:
                 return f"TRUE: {true_payload}, FALSE: {false_payload}", chain_true
         return None, None
 
-    async def _scan_time_based(self, payloads: List, sender_func: Callable, baseline_median: float) -> Tuple[str | None, tuple | None]:
-        for payload_template, sleep_time, _ in payloads:
-            payload = payload_template.format(sleep=sleep_time); durations, chain = [], None
-            for _ in range(2):
-                _, duration, is_blocked, used_chain = await sender_func(payload)
-                if chain is None: chain = used_chain
-                durations.append(baseline_median if is_blocked else duration)
-            if statistics.median(durations) > baseline_median + (sleep_time * 0.7): return payload, chain
-        return None, None
-
     async def _run_scan_for_parameter(self, page: Page, url: str, method: str, param_name: str, original_value: str, baseline_median: float, baseline_hash: Simhash, collaborator_url: str, create_request_args: Callable):
         total_delay = self.static_request_delay
         if self.rate_limit_active: total_delay += self.rate_limit_delay
         if total_delay > 0: await asyncio.sleep(total_delay * random.uniform(0.8, 1.2))
 
-        taint_contexts = await self._perform_taint_analysis(page, url, method, lambda taint: create_request_args(param_name, original_value + taint))
-        prefix = CONTEXT_PAYLOAD_PREFIX.get(next(iter(taint_contexts), None), "")
+        context = await self._perform_taint_analysis(page, url, method, lambda taint: create_request_args(param_name, original_value + taint))
+        print(f"  [*] Taint Analysis for param '{param_name}' found reflection context: {context}")
 
-        async def sender_with_learning(payload_to_inject):
-            chain = self.tamper_selector.select_chain()
-            tampered_payload = apply_tampers(prefix + payload_to_inject, list(chain))
+        # Define the async part of the objective function
+        async def async_objective(tamper_chain: Tuple[str, ...]) -> float:
+            sleep_time = 5
+            # Use a high-confidence time-based payload for the optimization probe
+            payloads = self.payload_generator.generate("TIME_BASED", context, options={"sleep_time": sleep_time})
+            if not payloads: return 0.0
+
+            payload_to_inject, _ = payloads[0]
+            tampered_payload = apply_tampers(payload_to_inject, list(tamper_chain))
+            request_args = await create_request_args(param_name, original_value + tampered_payload)
+
+            _, duration, is_blocked = await self._send_headless_request(url, method, **request_args)
+
+            if is_blocked: return 1.0  # WAF Penalty
+            if duration is not None and duration > baseline_median + (sleep_time * 0.7): return -1.0  # Detection Signal
+            return 0.0  # Neutral
+
+        # Create a synchronous wrapper for the optimizer that closes over the event loop
+        def create_sync_wrapper(loop):
+            def sync_objective_wrapper(tamper_chain: List[str]) -> float:
+                # This function is now a closure and has access to 'loop'
+                future = asyncio.run_coroutine_threadsafe(async_objective(tuple(tamper_chain)), loop)
+                try:
+                    # Add a timeout to prevent blocking indefinitely
+                    return future.result(timeout=25)
+                except (asyncio.TimeoutError, Exception) as e:
+                    print(f"  [!] Objective function timed out or failed: {e}")
+                    return 0.0 # Return a neutral score on failure
+            return sync_objective_wrapper
+
+        # Get the current event loop and create the specific wrapper for it
+        current_loop = asyncio.get_running_loop()
+        objective_wrapper = create_sync_wrapper(current_loop)
+
+        # Instantiate and run the optimizer
+        optimizer = BayesianTamperOptimizer(
+            objective_func=objective_wrapper,
+            n_calls=20,
+            n_initial_points=5
+        )
+
+        # The optimizer's optimize method is synchronous, so we run it in a thread
+        best_chain, best_score = await asyncio.to_thread(optimizer.optimize)
+
+        # If the optimizer found a vulnerability, report it and use the chain for other checks
+        if best_score < 0:
+            vuln_type = f"Time-Based SQLi (via BO)"
+            # Re-generate the payload that was used inside the optimizer
+            payload_used = self.payload_generator.generate("TIME_BASED", context, options={"sleep_time": 5})[0][0]
+            await self._report_vulnerability(url, vuln_type, param_name, payload_used, best_chain)
+            # Since we found a vuln, we can stop here for this parameter
+            return
+
+        # If no time-based vuln was found via BO, let's try boolean-based with the best chain
+        print(f"  [*] Optimizer didn't find time-based vuln. Trying boolean-based with best chain: {best_chain}")
+        async def sender_with_best_chain(payload_to_inject):
+            tampered_payload = apply_tampers(payload_to_inject, list(best_chain))
             request_args = create_request_args(param_name, original_value + tampered_payload)
             body, duration, is_blocked = await self._send_headless_request(url, method, **request_args)
-            if is_blocked: self.tamper_selector.update_stats(chain, -1.0)
-            return body, duration, is_blocked, chain
+            return body, duration, is_blocked, best_chain
 
-        # --- Prioritized Payload Scheduling ---
-        family_scores = defaultdict(lambda: 1.0)
+        bool_payload, bool_chain = await self._scan_boolean_based(sender_with_best_chain, baseline_hash, context)
+        if bool_payload:
+            await self._report_vulnerability(url, "Boolean-Based SQLi", param_name, bool_payload, bool_chain)
+            return
 
-        # Seeding round
-        seeding_payloads = {p[2]: p for p in TIME_BASED_PAYLOADS}.values() # Get one from each family
-        print(f"  [*] Running seeding round with {len(seeding_payloads)} payload families...")
-        for p_template, sleep, family in seeding_payloads:
-            _, duration, is_blocked, _ = await sender_with_learning(p_template.format(sleep=2)) # Use short sleep for seeding
-            if is_blocked: family_scores[family] *= 0.1 # Heavily penalize
-            elif duration > baseline_median + 1.4: family_scores[family] *= 5.0 # Boost
-
-        # Prioritize payload lists
-        sorted_time_payloads = sorted(TIME_BASED_PAYLOADS, key=lambda p: family_scores[p[2]], reverse=True)
-        sorted_bool_payloads = sorted(BOOLEAN_BASED_PAYLOADS, key=lambda p: family_scores[p[2]], reverse=True)
-
-        scan_functions = [
-            (self._scan_time_based, (sorted_time_payloads, sender_with_learning, baseline_median), "Time-Based SQLi"),
-            (self._scan_boolean_based, (sorted_bool_payloads, sender_with_learning, baseline_hash), "Boolean-Based SQLi"),
-            (self._scan_oast, (OOB_PAYLOADS, sender_with_learning, collaborator_url), "OAST-Based SQLi"),
-        ]
-        if self.rate_limit_active: random.shuffle(scan_functions)
-
-        for scan_func, args, vuln_type in scan_functions:
-            payload, chain = await scan_func(*args)
-            if payload:
-                self.tamper_selector.update_stats(chain, 1.0)
-                await self._report_vulnerability(url, vuln_type, param_name, prefix + payload, chain)
-                return
+        # TODO: Add OAST and Error-based checks here, also using the best_chain
 
     async def _report_vulnerability(self, url, vuln_type, param, payload, chain):
         vuln_info = {"url": url, "type": vuln_type, "parameter": param, "payload": payload, "tamper_chain": list(chain)}
-        async with self.lock: print(f"[+] Vulnerability Found: {vuln_info}"); self.vulnerable_points.append(vuln_info)
+        async with self.lock:
+            print(f"[bold red][+] Vulnerability Found: {json.dumps(vuln_info)}[/bold red]")
+            self.vulnerable_points.append(vuln_info)
 
     async def _scan_url(self, page: Page, url: str, collaborator_url: str | None):
         parsed_url = urlparse(url); query_params = parse_qs(parsed_url.query)
@@ -234,13 +257,20 @@ class Scanner:
             await self._run_scan_for_parameter(page, url, method, param_name, input_to_test.get("value", ""), baseline_median, baseline_hash, collaborator_url, create_form_request_args)
 
     async def scan_target(self, target_item: dict, collaborator_url: str | None = None, db_type: str | None = None):
+        # Initialize the payload generator with the detected DB type
+        self.payload_generator = AstPayloadGenerator(dialect=db_type)
+
         await self._initialize_httpx_client()
         page = await self.context.new_page()
         try:
             target_type, url = target_item.get("type"), target_item.get("url")
+            # Simple lock to prevent re-scanning the same URL if a vuln is found
+            # A more robust check might be needed for complex apps
             async with self.lock:
                 if any(p['url'] == url and p.get('parameter') for p in self.vulnerable_points):
-                    print(f"[*] Skipping {url} as a vulnerability has already been found."); return
+                    print(f"[*] Skipping {url} as a vulnerability has already been found in this URL.")
+                    return
+
             if target_type == 'form': await self._scan_form(page, target_item, collaborator_url)
             elif target_type == 'api' or (target_item.get("method", "GET").upper() == "POST" and target_item.get("content_type")):
                 method, content_type = target_item.get("method", "GET").upper(), target_item.get("content_type")
