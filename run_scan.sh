@@ -9,7 +9,8 @@ echo "--- Running SQLi Hunter Against New Target ---"
 python main.py \
     --url https://radio.espressolab.com/ \
     --json-report scan_report.json \
-    --depth 2
+    --depth 2 \
+    --dump-db
 
 echo "--- Scan Finished ---"
 echo "Results saved to scan_report.json"
