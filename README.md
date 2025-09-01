@@ -1,35 +1,25 @@
-# CyberScan Dashboard
+# SQLi Hunter
 
-A Next.js + TypeScript implementation of a cybersecurity tools dashboard. It showcases sample tools such as Nmap, SQLMap, OSINT, and Web scanning, along with recent scan results and summary charts.
+**SQLi Hunter** is a powerful, fast, and modern DAST tool focused exclusively on detecting SQL Injection vulnerabilities.
 
-## Features
+*This tool is currently under development.*
 
-- Dashboard of security tools
-- Recent scan results table
-- Summary charts built with Chart.js
+## Features (Planned)
 
-See [docs/PROMISES_TO_FEATURES.md](docs/PROMISES_TO_FEATURES.md) for the mapping of promises to implemented features. Architectural trade-offs are captured in [docs/DECISIONS.md](docs/DECISIONS.md).
+-   Advanced, asynchronous web crawler
+-   Multi-threaded scanning engine
+-   Support for Error-based, Time-based, and Boolean-based SQLi detection
+-   WAF evasion through tamper scripts
+-   Detailed reporting
 
-## Getting Started
+## Installation
 
-### Prerequisites
-- Node.js 20
-- pnpm
-- (for live scanning) system tools: `nmap`, `sqlmap`, `whois`, `curl`
-  - install on Debian/Ubuntu via `apt-get install nmap sqlmap`
-  - set `USE_MOCKS=false` to enable live scans
-
-### Installation
-```sh
-pnpm install
+```bash
+pip install -r requirements.txt
 ```
 
-### Development
-```sh
-pnpm dev
-```
+## Usage
 
-### Testing
-```sh
-pnpm test
+```bash
+python main.py --url <target_url>
 ```
