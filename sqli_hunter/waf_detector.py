@@ -13,7 +13,7 @@ import re
 # in response headers, cookies, and the response body.
 WAF_SIGNATURES = {
     "Cloudflare": {
-        "headers": {"server": "cloudflare"}, # Headers are case-insensitive
+        "headers": {"server": "cloudflare"},
         "cookies": ["__cfduid", "cf_clearance"],
         "body": r"cloudflare|ray id|checking your browser"
     },
@@ -31,6 +31,26 @@ WAF_SIGNATURES = {
         "headers": {},
         "cookies": ["incap_ses", "visid_incap"],
         "body": r"incapsula|request unsuccessful"
+    },
+    "AWS WAF": {
+        "headers": {"server": "awselb"},
+        "cookies": [],
+        "body": r"aws|amazon-web-services"
+    },
+    "F5 BIG-IP": {
+        "headers": {"server": "big-ip"},
+        "cookies": ["BIGipServer"],
+        "body": r"f5|big-ip"
+    },
+    "Barracuda": {
+        "headers": {"server": "barracuda"},
+        "cookies": ["barracuda_waf_cookie"],
+        "body": r"barracuda"
+    },
+    "ModSecurity": {
+        "headers": {"server": "mod_security"},
+        "cookies": [],
+        "body": r"mod_security|modsecurity"
     }
 }
 

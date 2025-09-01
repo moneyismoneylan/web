@@ -19,6 +19,7 @@ from sqli_hunter.scanner import Scanner
 from sqli_hunter.exploiter import Exploiter
 from sqli_hunter.waf_detector import WafDetector
 from sqli_hunter.tamper import get_tampers_for_waf
+from sqli_hunter.db_fingerprinter import DbFingerprinter
 
 SCANNER_WORKERS = 10
 
@@ -36,11 +37,11 @@ def display_banner(console: Console):
     """
     console.print(banner)
 
-async def scanner_worker(queue: asyncio.Queue, scanner: Scanner, tampers: list[str], collaborator_url: str | None):
+async def scanner_worker(queue: asyncio.Queue, scanner: Scanner, tampers: list[str], collaborator_url: str | None, db_type: str | None):
     while True:
         target_item = await queue.get()
         if target_item is None: break
-        await scanner.scan_target(target_item, tampers, collaborator_url)
+        await scanner.scan_target(target_item, tampers, collaborator_url, db_type)
         queue.task_done()
 
 async def main():
@@ -50,6 +51,8 @@ async def main():
     parser.add_argument("--no-crawl", action="store_true", help="Disable the crawler and only scan the provided URL.")
     parser.add_argument("--collaborator", help="Your Out-of-Band server URL.")
     parser.add_argument("--dump-db", action="store_true", help="Attempt to extract the database name.")
+    parser.add_argument("--cookie", help="The session cookie to use for authenticated scans (e.g., 'name=value').")
+    parser.add_argument("--json-report", help="Save the scan results to a JSON file.")
 
     args = parser.parse_args()
     console = Console()
@@ -63,14 +66,25 @@ async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         context = await browser.new_context()
+        if args.cookie:
+            try:
+                name, value = args.cookie.split('=', 1)
+                await context.add_cookies([{"name": name.strip(), "value": value.strip(), "domain": urlparse(args.url).netloc}])
+                console.print("[green][*] Session cookie set.[/green]")
+            except ValueError:
+                console.print("[red][!] Invalid cookie format. Please use 'name=value'.[/red]")
+
         queue = asyncio.Queue()
 
         waf_detector = WafDetector(context)
         waf_name = await waf_detector.check_waf(args.url)
         tampers_to_use = get_tampers_for_waf(waf_name)
 
+        db_fingerprinter = DbFingerprinter(context)
+        db_type = await db_fingerprinter.detect_db(args.url)
+
         scanner = Scanner(context)
-        scanner_tasks = [asyncio.create_task(scanner_worker(queue, scanner, tampers_to_use, args.collaborator)) for _ in range(SCANNER_WORKERS)]
+        scanner_tasks = [asyncio.create_task(scanner_worker(queue, scanner, tampers_to_use, args.collaborator, db_type)) for _ in range(SCANNER_WORKERS)]
 
         if args.no_crawl:
             console.print("[yellow][!] Crawler disabled. Scanning only the provided URL.[/yellow]")
@@ -108,6 +122,12 @@ async def main():
                     console.print("\n[yellow][!] --dump-db requires an error-based vulnerability, none was found.[/yellow]")
         else:
             console.print("\n[bold green][-] No vulnerabilities were found.[/bold green]")
+
+        if args.json_report:
+            import json
+            with open(args.json_report, 'w') as f:
+                json.dump(scanner.vulnerable_points, f, indent=4)
+            console.print(f"[green][*] Scan report saved to {args.json_report}[/green]")
 
         await browser.close()
 

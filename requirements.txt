@@ -1,3 +1,4 @@
 # Core libraries for SQLi Hunter
 rich
 playwright
+beautifulsoup4
