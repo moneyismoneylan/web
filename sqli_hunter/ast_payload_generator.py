@@ -40,7 +40,7 @@ class AstPayloadGenerator:
         # Variations
         # 1. Simple AND/OR
         for logic_op in [exp.And, exp.Or]:
-            condition = logic_op(left=exp.TRUE(), right=sleep_func.copy())
+            condition = logic_op(left=exp.Boolean(this=True), right=sleep_func.copy())
             sql = self._build_sql(condition, context)
             payloads.append((sql, f"{self.dialect.upper()}_SLEEP"))
 
@@ -68,8 +68,8 @@ class AstPayloadGenerator:
 
         for true_cond, false_cond in conditions:
             for logic_op in [exp.And, exp.Or]:
-                true_expr = logic_op(left=exp.TRUE(), right=true_cond.copy())
-                false_expr = logic_op(left=exp.TRUE(), right=false_cond.copy())
+                true_expr = logic_op(left=exp.Boolean(this=True), right=true_cond.copy())
+                false_expr = logic_op(left=exp.Boolean(this=True), right=false_cond.copy())
 
                 true_sql = self._build_sql(true_expr, context)
                 false_sql = self._build_sql(false_expr, context)

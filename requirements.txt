@@ -8,3 +8,4 @@ httpx
 sqlglot
 scikit-optimize
 numpy # scikit-optimize requires numpy
+playwright-stealth

@@ -76,9 +76,11 @@ class Scanner:
             if method_upper == "GET":
                 response = await page.request.get(url, params=params, timeout=timeout)
             elif method_upper == "POST":
-                # Note: Playwright's APIRequestContext handles 'data' and 'json' automatically based on content-type headers
-                # or the type of the passed object. We pass both if they exist.
-                response = await page.request.post(url, params=params, data=data, json=json_data, timeout=timeout)
+                # To send a JSON body, the `data` parameter should be a dictionary.
+                # Playwright will automatically set the Content-Type to application/json.
+                # The 'json' kwarg is not valid for page.request.post.
+                post_body = json_data if json_data is not None else data
+                response = await page.request.post(url, params=params, data=post_body, timeout=timeout)
             else:
                 raise NotImplementedError(f"Method {method} not implemented in _send_browser_request")
 
@@ -196,7 +198,7 @@ class Scanner:
         print(f"  [*] Optimizer didn't find time-based vuln. Trying boolean-based with best chain: {best_chain}")
         async def sender_with_best_chain(payload_to_inject):
             tampered_payload = apply_tampers(payload_to_inject, list(best_chain))
-            request_args = create_request_args(param_name, original_value + tampered_payload)
+            request_args = await create_request_args(param_name, original_value + tampered_payload)
             body, duration, is_blocked = await self._send_headless_request(url, method, **request_args)
             return body, duration, is_blocked, best_chain
 
