@@ -1,4 +1,3 @@
 # Core libraries for SQLi Hunter
-httpx[http2]
-beautifulsoup4
 rich
+playwright
