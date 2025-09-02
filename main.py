@@ -44,7 +44,7 @@ async def scanner_worker(queue: asyncio.Queue, scanner: Scanner, collaborator_ur
             # Circuit breaker: Timeout for each scan target to prevent stalls
             await asyncio.wait_for(
                 scanner.scan_target(target_item, collaborator_url, db_type),
-                timeout=180.0  # 3-minute timeout per target
+                timeout=600.0  # 10-minute timeout per target
             )
         except asyncio.TimeoutError:
             url = target_item.get("url", "Unknown Target")
@@ -64,6 +64,7 @@ async def main():
     parser.add_argument("--dump-db", action="store_true", help="Attempt to extract the database name.")
     parser.add_argument("--cookie", help="The session cookie to use for authenticated scans (e.g., 'name=value').")
     parser.add_argument("--json-report", help="Save the scan results to a JSON file.")
+    parser.add_argument("--n-calls", type=int, default=25, help="Number of Bayesian Optimizer calls per parameter (higher is more thorough).")
     parser.add_argument("--retest", help="Run in regression mode using a previous JSON report.")
 
     args = parser.parse_args()
@@ -98,7 +99,7 @@ async def main():
         db_type = await db_fingerprinter.detect_db(args.url)
 
         canary_store = {}
-        scanner = Scanner(context, canary_store=canary_store, waf_name=waf_name)
+        scanner = Scanner(context, canary_store=canary_store, waf_name=waf_name, n_calls=args.n_calls)
         scanner_tasks = [asyncio.create_task(scanner_worker(queue, scanner, args.collaborator, db_type)) for _ in range(SCANNER_WORKERS)]
 
         if args.retest:
@@ -170,7 +171,7 @@ async def main():
                 json.dump(unique_vulnerabilities, f, indent=4)
             console.print(f"[green][*] Scan report saved to {args.json_report}[/green]")
 
-        await scanner.close()
+        # Close all resources
         await browser.close()
 
 if __name__ == "__main__":
