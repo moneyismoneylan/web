@@ -1,0 +1,6 @@
+{
+    "dns": {
+        "enabled": false,
+        "server": ""
+    }
+}
