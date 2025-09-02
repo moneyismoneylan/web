@@ -1,17 +1,22 @@
 import sys
 import asyncio
+import random
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFormLayout, QLineEdit, QSpinBox, QCheckBox,
-                             QPushButton, QPlainTextEdit, QHBoxLayout)
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+                             QPushButton, QPlainTextEdit, QHBoxLayout, QLabel,
+                             QGraphicsDropShadowEffect)
+from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer, Qt
+from PyQt6.QtGui import QPainter, QColor, QFont
 from rich.console import Console
 
 # Import the core logic from our refactored main.py
 from main import run_scan_logic, display_banner
 
 HACKER_THEME_STYLESHEET = """
-    QMainWindow, QWidget {
-        background-color: #0d1117;
+    QMainWindow {
+        background-color: #000000;
+    }
+    QWidget {
         color: #00ff00;
         font-family: 'Consolas', 'Courier New', monospace;
     }
@@ -57,6 +62,43 @@ HACKER_THEME_STYLESHEET = """
     }
 """
 
+
+class MatrixRainWidget(QWidget):
+    """Animated matrix-style background for a cyberpunk/arcade feel."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.symbols = "01ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%&"  # characters to draw
+        self.font = QFont("Consolas", 14)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update)
+        self.timer.start(50)
+        self.columns = 0
+        self.drops = []
+
+    def resizeEvent(self, event):
+        char_width = self.fontMetrics().horizontalAdvance("W")
+        self.columns = max(1, self.width() // char_width)
+        self.drops = [0 for _ in range(self.columns)]
+        super().resizeEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#000000"))
+        painter.setFont(self.font)
+        char_width = self.fontMetrics().horizontalAdvance("W")
+        char_height = self.fontMetrics().height()
+        for i in range(self.columns):
+            text = random.choice(self.symbols)
+            x = i * char_width
+            y = self.drops[i] * char_height
+            painter.setPen(QColor("#00ff00"))
+            painter.drawText(x, y, text)
+            if y > self.height() and random.random() > 0.975:
+                self.drops[i] = 0
+            else:
+                self.drops[i] += 1
+
 class Stream(QObject):
     """Custom stream object to redirect console output to a Qt widget."""
     newText = pyqtSignal(str)
@@ -91,11 +133,21 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(HACKER_THEME_STYLESHEET)
 
         # --- Layouts ---
-        self.central_widget = QWidget()
+        self.central_widget = MatrixRainWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
         self.form_layout = QFormLayout()
         self.button_layout = QHBoxLayout()
+
+        # --- Title Label ---
+        self.title_label = QLabel("SQLi Hunter")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setStyleSheet("font-size: 28px; margin-bottom: 10px;")
+        glow = QGraphicsDropShadowEffect()
+        glow.setBlurRadius(25)
+        glow.setColor(QColor("#00ff00"))
+        glow.setOffset(0)
+        self.title_label.setGraphicsEffect(glow)
 
         # --- Input Widgets ---
         self.url_input = QLineEdit("https://www.fenerbahce.org/")
@@ -122,13 +174,21 @@ class MainWindow(QMainWindow):
         # --- Log Output ---
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
+        self.log_output.setStyleSheet("background-color: #000000; color: #00ff00;")
+        self.log_output.setFont(QFont("Consolas", 10))
 
         # --- Buttons ---
         self.start_button = QPushButton("Start Scan")
+        btn_glow = QGraphicsDropShadowEffect()
+        btn_glow.setBlurRadius(15)
+        btn_glow.setColor(QColor("#00ff00"))
+        btn_glow.setOffset(0)
+        self.start_button.setGraphicsEffect(btn_glow)
         self.start_button.clicked.connect(self.start_scan)
         self.button_layout.addWidget(self.start_button)
 
         # --- Assemble Main Layout ---
+        self.main_layout.addWidget(self.title_label)
         self.main_layout.addLayout(self.form_layout)
         self.main_layout.addLayout(self.button_layout)
         self.main_layout.addWidget(self.log_output)
