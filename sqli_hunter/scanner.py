@@ -9,6 +9,8 @@ import uuid
 import json
 import random
 import itertools
+from pathlib import Path
+import ahocorasick
 from simhash import Simhash
 import dns.asyncresolver
 import cloudscraper
@@ -51,6 +53,26 @@ class Scanner:
         self.adv_tamper = adv_tamper
         self.n_calls = n_calls
         if self.static_request_delay > 0: print(f"[*] WAF policy adaptation: Applying a {self.static_request_delay}s delay between requests.")
+        self.signature_automaton = self._build_signature_automaton()
+
+    def _build_signature_automaton(self) -> ahocorasick.Automaton | None:
+        automaton = ahocorasick.Automaton()
+        signatures_path = Path(__file__).with_name("attack_signatures.json")
+        try:
+            with open(signatures_path, "r", encoding="utf-8") as f:
+                signatures = json.load(f).get("signatures", [])
+            for sig in signatures:
+                pattern = sig.get("pattern", "").lower()
+                weight = sig.get("weight", 0.0)
+                if pattern:
+                    automaton.add_word(pattern, (pattern, weight))
+            automaton.make_automaton()
+            return automaton
+        except FileNotFoundError:
+            if self.debug: print(f"    [bold yellow]Debug: Signature file not found at {signatures_path}")
+        except Exception as e:
+            if self.debug: print(f"    [bold red]Debug: Failed to load signatures: {e}")
+        return None
 
     def _update_rate_limit_status(self, status: int, is_waf_block: bool):
         is_rate_limited = status in [429, 503]
@@ -122,6 +144,16 @@ class Scanner:
         hash_distance = baseline_hash.distance(Simhash(response_body))
         normalized_distance = min(hash_distance / 64.0, 1.0)
         anomaly_score += (normalized_distance * 0.4)
+
+        # Aho-Corasick attack signature detection
+        if self.signature_automaton:
+            found_patterns: Set[str] = set()
+            for _, (pattern, weight) in self.signature_automaton.iter(response_body.lower()):
+                if pattern not in found_patterns:
+                    anomaly_score += weight
+                    found_patterns.add(pattern)
+            if self.debug and found_patterns:
+                print(f"    [bold yellow]Debug: Signature matches:[/] {', '.join(found_patterns)}")
 
         # Check for classic SQL error patterns and infer dialect
         # This is a simplified mapping. A more robust solution would use a more detailed map.

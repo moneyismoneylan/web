@@ -1,0 +1,9 @@
+{
+  "signatures": [
+    {"pattern": "union select", "weight": 0.15},
+    {"pattern": "information_schema", "weight": 0.15},
+    {"pattern": "syntax error", "weight": 0.2},
+    {"pattern": "warning: mysql", "weight": 0.25},
+    {"pattern": "unclosed quotation mark", "weight": 0.25}
+  ]
+}
