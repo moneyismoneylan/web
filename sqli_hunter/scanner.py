@@ -34,7 +34,7 @@ class Scanner:
         "' OR 1=1#", "' OR 1=1-- ", "' OR 'x'='x",
     ]
 
-    def __init__(self, browser_context: BrowserContext, scraper: cloudscraper.CloudScraper, canary_store: Dict, waf_name: str | None = None, n_calls: int = 20, debug: bool = False):
+    def __init__(self, browser_context: BrowserContext, scraper: cloudscraper.CloudScraper, canary_store: Dict, waf_name: str | None = None, n_calls: int = 20, debug: bool = False, adv_tamper: bool = False):
         self.context = browser_context
         self.scraper = scraper
         self.debug = debug
@@ -47,7 +47,8 @@ class Scanner:
         self.rate_limit_active = False
         self.rate_limit_delay = 1.0
         self.successful_requests_since_rl = 0
-        self.payload_generator = None
+        self.payload_generator = AstPayloadGenerator(dialect="mysql") # Defaulting to mysql, can be updated later
+        self.adv_tamper = adv_tamper
         self.n_calls = n_calls
         if self.static_request_delay > 0: print(f"[*] WAF policy adaptation: Applying a {self.static_request_delay}s delay between requests.")
 
@@ -220,6 +221,38 @@ class Scanner:
         print("    [-] UNION-based scan did not find a vulnerability.")
         return False
 
+    async def _boolean_based_ast_scan(self, url: str, method: str, param_name: str, create_request_args: Callable) -> bool:
+        """
+        Performs a boolean-based scan using the AST payload generator, supporting tampering.
+        This method tests for vulnerabilities by comparing the responses of true/false payload pairs.
+        """
+        print(f"  [*] Starting AST-based boolean scan for param '{param_name}' (Tamper mode: {'On' if self.adv_tamper else 'Off'})...")
+        # For now, we assume a simple context. This can be improved with taint analysis.
+        context = "HTML_ATTRIBUTE_SINGLE_QUOTED"
+
+        # Generate payload pairs (both standard and tampered if adv_tamper is on)
+        payload_pairs = self.payload_generator.generate("BOOLEAN_BASED", context=context, tamper=self.adv_tamper)
+
+        for true_payload, false_payload, family in payload_pairs:
+            true_args = await create_request_args(true_payload)
+            true_body, _, is_blocked_true, _ = await self._send_headless_request(url, method, **true_args)
+            if is_blocked_true or not true_body: continue
+
+            false_args = await create_request_args(false_payload)
+            false_body, _, is_blocked_false, _ = await self._send_headless_request(url, method, **false_args)
+            if is_blocked_false or not false_body: continue
+
+            if Simhash(true_body).distance(Simhash(false_body)) > 5:
+                vuln_type = "Boolean-Based SQLi (AST)"
+                if self.adv_tamper:
+                    vuln_type += " (Tampered)"
+                print(f"    [bold green][+] Confirmed {vuln_type}![/bold green]")
+                await self._report_vulnerability(url, vuln_type, param_name, true_payload, (family,), method, true_args)
+                return True # Stop after finding one vulnerability with this method
+
+        print(f"    [-] AST-based boolean scan did not find a vulnerability for param '{param_name}'.")
+        return False
+
     async def _perform_taint_analysis(self, page: Page, url: str, method: str, create_request_args: Callable) -> str:
         """Performs taint analysis using headless response parsing instead of browser rendering."""
         taint = "sqlihunter" + uuid.uuid4().hex[:8]
@@ -272,26 +305,38 @@ class Scanner:
                     fuzz_data[param_name] = p_value
                     return {'data': fuzz_data}
                 is_vuln = await self._fuzz_parameter_for_anomalies(url, method, param_name, original_value_for_param, create_request_args, baseline_status, baseline_hash, baseline_time, base_data)
-                if is_vuln: return # Stop if error/boolean based is found
+                if is_vuln: return
 
                 # If no other vuln found, try for UNION based
                 is_union_vuln = await self._union_based_scan(url, method, param_name, original_value_for_param, create_request_args, baseline_hash)
                 if is_union_vuln: return
 
+                is_ast_vuln = await self._boolean_based_ast_scan(url, method, param_name, create_request_args)
+                if is_ast_vuln: return
+
         elif target_type == 'url':
             parsed_url = urlparse(url)
             query_params = parse_qs(parsed_url.query)
             if not query_params: return
+
             baseline_status, baseline_time, baseline_hash, baseline_body = await self._get_baseline(url, method, params=query_params)
             if not baseline_hash: return
-            for param_name, values in query_params.items():
-                async def create_request_args(p_value): return {'params': {**query_params, param_name: p_value}}
-                is_vuln = await self._fuzz_parameter_for_anomalies(url, method, param_name, values[0], create_request_args, baseline_status, baseline_hash, baseline_time, query_params)
-                if is_vuln: return # Stop if error/boolean based is found
 
-                # If no other vuln found, try for UNION based
-                is_union_vuln = await self._union_based_scan(url, method, param_name, values[0], create_request_args, baseline_hash)
+            for param_name, values in query_params.items():
+                original_value = values[0] if values else ""
+                async def create_request_args(p_value):
+                    new_params = query_params.copy()
+                    new_params[param_name] = p_value
+                    return {'params': new_params}
+
+                is_vuln = await self._fuzz_parameter_for_anomalies(url, method, param_name, original_value, create_request_args, baseline_status, baseline_hash, baseline_time, query_params)
+                if is_vuln: return
+
+                is_union_vuln = await self._union_based_scan(url, method, param_name, original_value, create_request_args, baseline_hash)
                 if is_union_vuln: return
+
+                is_ast_vuln = await self._boolean_based_ast_scan(url, method, param_name, create_request_args)
+                if is_ast_vuln: return
         else:
             if self.debug: print(f"[!] Skipping target with unhandled type: {target_type}")
 

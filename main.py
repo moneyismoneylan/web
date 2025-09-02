@@ -5,6 +5,7 @@ SQLi Hunter - Main Entry Point.
 import argparse
 import asyncio
 import json
+import random
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 from playwright_stealth.stealth import Stealth
@@ -54,9 +55,11 @@ async def scanner_worker(queue: asyncio.Queue, scanner: Scanner, collaborator_ur
         finally:
             queue.task_done()
 
-async def run_scan_logic(args: dict):
+async def run_scan_logic(args: dict, console: Console | None = None):
     """The core logic of the scanner, refactored to be callable from other modules."""
-    console = Console()
+    if console is None:
+        console = Console()
+
     url = args.get("url")
     if not url:
         console.print("[red]URL is a required argument.[/red]")
@@ -70,8 +73,11 @@ async def run_scan_logic(args: dict):
     async with Stealth().use_async(async_playwright()) as p:
         browser = await p.chromium.launch()
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.51 Safari/537.36",
-            viewport={'width': 1920, 'height': 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+            viewport={
+                'width': 1280 + random.randint(0, 100),
+                'height': 720 + random.randint(0, 100)
+            },
             locale='en-US',
             timezone_id='America/New_York'
         )
@@ -89,7 +95,15 @@ async def run_scan_logic(args: dict):
         waf_name = await waf_detector.check_waf(url)
 
         canary_store = {}
-        scanner = Scanner(context, scraper, canary_store=canary_store, waf_name=waf_name, n_calls=args.get("n_calls", 25), debug=args.get("debug", False))
+        scanner = Scanner(
+            context,
+            scraper,
+            canary_store=canary_store,
+            waf_name=waf_name,
+            n_calls=args.get("n_calls", 25),
+            debug=args.get("debug", False),
+            adv_tamper=args.get("adv_tamper", False)
+        )
         scanner_tasks = [asyncio.create_task(scanner_worker(queue, scanner, args.get("collaborator"))) for _ in range(SCANNER_WORKERS)]
 
         if args.get("retest"):
@@ -169,6 +183,7 @@ def main():
     parser.add_argument("--n-calls", type=int, default=25, help="Number of Bayesian Optimizer calls per parameter (higher is more thorough).")
     parser.add_argument("--retest", help="Run in regression mode using a previous JSON report.")
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging of requests and responses.")
+    parser.add_argument("--adv-tamper", action="store_true", help="Enable advanced AST-based payload tampering (AdvSQLi).")
     args = parser.parse_args()
 
     if not args.url:

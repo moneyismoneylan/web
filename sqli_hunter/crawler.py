@@ -58,6 +58,20 @@ class Crawler:
             print(f"  [*] Navigating to {url} with Playwright...")
             response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
+            # Simulate human-like mouse movements to evade behavioral bot detection
+            try:
+                for i in range(10):
+                    await page.mouse.move(
+                        random.randint(0, 1000),
+                        random.randint(0, 800),
+                        steps=random.randint(5, 15)
+                    )
+                    await asyncio.sleep(random.uniform(0.1, 0.3))
+            except Exception:
+                pass # Ignore errors if the page closes unexpectedly
+
+            await page.wait_for_timeout(5000) # Wait for potential background JS checks
+
             if not response.ok:
                 print(f"  [!] Received non-OK status {response.status} from {url}. Checking for JS challenge...")
                 content = await page.content()
@@ -65,11 +79,11 @@ class Crawler:
                     print("  [!] Cloudflare challenge detected. Waiting for resolution...")
                     try:
                         # Wait for either a successful navigation or for the network to be idle for a while
-                        await page.wait_for_navigation(timeout=30000)
+                        await page.wait_for_url(lambda url: url != page.url, timeout=60000)
                         print("  [+] Navigation after challenge detected. Proceeding...")
                     except Error:
                         print("  [!] Timed out waiting for navigation. Trying to wait for network idle...")
-                        await page.wait_for_load_state('networkidle', timeout=30000)
+                        await page.wait_for_load_state('networkidle', timeout=60000)
                         print("  [*] Network is now idle. Proceeding with page content.")
                 else:
                     print("  [!] No JS challenge detected. Aborting crawl for this page.")
