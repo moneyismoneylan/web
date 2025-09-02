@@ -10,7 +10,8 @@ python main.py \
     --url https://radio.espressolab.com/ \
     --json-report scan_report.json \
     --depth 2 \
-    --dump-db
+    --dump-db \
+    --debug
 
 echo "--- Scan Finished ---"
 echo "Results saved to scan_report.json"

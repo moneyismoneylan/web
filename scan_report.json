@@ -1,0 +1,21 @@
+[
+    {
+        "url": "https://radio.espressolab.com/",
+        "type": "Error-Based SQLi",
+        "parameter": "username",
+        "payload": "'",
+        "tamper_chain": [
+            "anomaly_scan"
+        ],
+        "method": "POST",
+        "request_data": {
+            "data": {
+                "username": "",
+                "password": "123456"
+            }
+        },
+        "dialect": "mssql",
+        "union_info": null,
+        "baseline_time": 0.17959461600003124
+    }
+]

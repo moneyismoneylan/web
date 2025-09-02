@@ -6,15 +6,18 @@ This module is responsible for identifying the Web Application Firewall
 protecting the target application. It uses a combination of response header,
 status code, and body content analysis.
 """
-from playwright.async_api import BrowserContext, Error, Response
+from playwright.async_api import BrowserContext, Error
 import re
+import asyncio
+import cloudscraper
+from urllib.parse import urlparse
 
 # A database of WAF signatures. This can be expanded.
 WAF_SIGNATURES = {
     "Cloudflare": {
         "headers": {"Server": "cloudflare"},
         "cookies": ["__cfduid", "cf_bm"],
-        "body": r'cloudflare\.com|ray id|checking your browser'
+        "body": r'cloudflare\.com|ray id|checking your browser|challenge-platform'
     },
     "Akamai": {
         "headers": {"Server": "AkamaiGHost", "X-Akamai-Transformed": ".*"},
@@ -50,20 +53,18 @@ class WafDetector:
     Detects a WAF by sending a malicious probe and checking the response
     against a known set of WAF signatures.
     """
-    def __init__(self, browser_context: BrowserContext):
+    def __init__(self, browser_context: BrowserContext, scraper: cloudscraper.CloudScraper):
         self.context = browser_context
+        self.scraper = scraper
 
-    async def _check_signatures(self, response: Response) -> str | None:
-        """Compares response headers, cookies, and body against the WAF signature DB."""
+    def _check_signatures_headless(self, response, cookies) -> str | None:
+        """Compares response headers, cookies, and body against the WAF signature DB using headless response."""
         if not response:
             return None
 
         headers = {k.lower(): v for k, v in response.headers.items()}
-        cookies = {c['name'] for c in await self.context.cookies(response.url)}
-        try:
-            body = await response.text()
-        except Error:
-            body = ""
+        cookie_names = {c.name for c in cookies}
+        body = response.text
 
         for waf_name, signatures in WAF_SIGNATURES.items():
             # Check headers
@@ -72,48 +73,64 @@ class WafDetector:
                     return waf_name
             # Check cookies
             for cookie_name in signatures.get("cookies", []):
-                if any(cookie.startswith(cookie_name) for cookie in cookies):
+                if any(c.startswith(cookie_name) for c in cookie_names):
                     return waf_name
             # Check body
             if re.search(signatures.get("body", ""), body, re.IGNORECASE):
                 return waf_name
         return None
 
+    async def _transfer_cookies_to_browser_context(self, scraper: cloudscraper.CloudScraper, url: str):
+        """Transfers cookies from cloudscraper to the Playwright browser context."""
+        parsed_url = urlparse(url)
+        cookies_to_add = []
+        for cookie in scraper.cookies:
+            cookies_to_add.append({
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain or parsed_url.netloc,
+                "path": cookie.path or "/",
+                "expires": cookie.expires,
+                "httpOnly": cookie.has_nonstandard_attr('HttpOnly'),
+                "secure": cookie.secure,
+            })
+        if cookies_to_add:
+            await self.context.add_cookies(cookies_to_add)
+
     async def check_waf(self, base_url: str) -> str | None:
         """
-        Probes the target to identify the WAF.
+        Probes the target to identify the WAF using a headless, JS-enabled client.
 
         :param base_url: The base URL of the target application.
         :return: The name of the detected WAF or None.
         """
-        page = await self.context.new_page()
         print("[*] Starting WAF fingerprinting...")
+
+        # First, check the base response without a malicious probe
         try:
-            # First, check the base response without a malicious probe
-            try:
-                response = await page.goto(base_url, wait_until="domcontentloaded", timeout=10000)
-                waf_name = await self._check_signatures(response)
-                if waf_name:
-                    print(f"[+] WAF Detected on initial request: {waf_name}")
-                    return waf_name
-            except Error:
-                pass # Ignore initial request failure
+            response = await asyncio.to_thread(self.scraper.get, base_url, timeout=15)
+            await self._transfer_cookies_to_browser_context(self.scraper, base_url)
 
-            # If no WAF found, send a malicious probe to trigger it
-            probe_url = base_url.rstrip('/') + MALICIOUS_PROBE_URL
-            try:
-                response = await page.goto(probe_url, wait_until="domcontentloaded", timeout=10000)
-                waf_name = await self._check_signatures(response)
-                if waf_name:
-                    print(f"[+] WAF Detected after malicious probe: {waf_name}")
-                    return waf_name
-            except Error:
-                # Sometimes the request itself fails, which is a signal.
-                # A more advanced implementation could analyze the error.
-                pass
+            waf_name = self._check_signatures_headless(response, self.scraper.cookies)
+            if waf_name:
+                print(f"[+] WAF Detected on initial request: {waf_name}")
+                return waf_name
+        except Exception:
+            pass # Ignore initial request failure
 
-        finally:
-            await page.close()
+        # If no WAF found, send a malicious probe to trigger it
+        probe_url = base_url.rstrip('/') + MALICIOUS_PROBE_URL
+        try:
+            response = await asyncio.to_thread(self.scraper.get, probe_url, timeout=15)
+            await self._transfer_cookies_to_browser_context(self.scraper, probe_url)
+
+            waf_name = self._check_signatures_headless(response, self.scraper.cookies)
+            if waf_name:
+                print(f"[+] WAF Detected after malicious probe: {waf_name}")
+                return waf_name
+        except Exception:
+            # A more advanced implementation could analyze the error.
+            pass
 
         print("[-] No specific WAF detected.")
         return None

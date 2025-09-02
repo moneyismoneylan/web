@@ -11,6 +11,7 @@ from playwright_stealth.stealth import Stealth
 from rich.console import Console
 from rich.table import Table
 import dns.asyncresolver
+import cloudscraper
 
 from sqli_hunter.crawler import Crawler
 from sqli_hunter.scanner import Scanner
@@ -65,6 +66,7 @@ async def main():
     parser.add_argument("--json-report", help="Save the scan results to a JSON file.")
     parser.add_argument("--n-calls", type=int, default=25, help="Number of Bayesian Optimizer calls per parameter (higher is more thorough).")
     parser.add_argument("--retest", help="Run in regression mode using a previous JSON report.")
+    parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging of requests and responses.")
 
     args = parser.parse_args()
     console = Console()
@@ -75,8 +77,6 @@ async def main():
 
     async with Stealth().use_async(async_playwright()) as p:
         browser = await p.chromium.launch()
-        # Use a common User-Agent and other properties to avoid simple bot detection
-        # Note: The stealth plugin may override some of these, but we set them as a baseline.
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.51 Safari/537.36",
             viewport={'width': 1920, 'height': 1080},
@@ -92,11 +92,15 @@ async def main():
                 console.print("[red][!] Invalid cookie format. Please use 'name=value'.[/red]")
 
         queue = asyncio.Queue()
-        waf_detector = WafDetector(context)
+
+        # Create a single, shared cloudscraper instance
+        scraper = cloudscraper.create_scraper()
+
+        waf_detector = WafDetector(context, scraper)
         waf_name = await waf_detector.check_waf(args.url)
 
         canary_store = {}
-        scanner = Scanner(context, canary_store=canary_store, waf_name=waf_name, n_calls=args.n_calls)
+        scanner = Scanner(context, scraper, canary_store=canary_store, waf_name=waf_name, n_calls=args.n_calls, debug=args.debug)
         scanner_tasks = [asyncio.create_task(scanner_worker(queue, scanner, args.collaborator)) for _ in range(SCANNER_WORKERS)]
 
         if args.retest:
@@ -107,8 +111,6 @@ async def main():
 
                 urls_to_test = {vuln['url'] for vuln in previous_vulns}
                 for url in urls_to_test:
-                    # This is a simplified re-test. It just re-scans the entire URL.
-                    # A more advanced version would re-test the specific parameter.
                     await queue.put({"type": "url", "url": url, "method": "GET"})
                 console.print(f"[*] Queued {len(urls_to_test)} unique URLs for re-testing.")
 
@@ -152,14 +154,14 @@ async def main():
                 table.add_row(vuln['url'], vuln.get('parameter', 'N/A'), vuln['type'], str(vuln['payload']))
             console.print(table)
             if args.dump_db:
-                error_based_vuln = next((v for v in unique_vulnerabilities if "Error-Based" in v['type']), None)
+                # For now, we only have a reliable dumper for MSSQL Error-Based vulns
+                error_based_vuln = next((v for v in unique_vulnerabilities if "Error-Based" in v['type'] and v.get('dialect') == 'mssql'), None)
+
                 if error_based_vuln:
                     exploiter = Exploiter(context)
-                    # Use the same tamper chain that was successful for detection
-                    successful_chain = error_based_vuln.get('tamper_chain', [])
-                    print(f"[*] Attempting to dump data using successful tamper chain: {successful_chain}")
-                    await exploiter.extract_data_error_based(error_based_vuln, successful_chain)
-                else: console.print("\n[yellow][!] --dump-db requires an error-based vulnerability, none was found.[/yellow]")
+                    await exploiter.extract_data(error_based_vuln)
+                else:
+                    console.print("\n[yellow][!] --dump-db requires a supported vulnerability type (e.g., MSSQL Error-Based), none was found.[/yellow]")
         else:
             console.print("\n[bold green][-] No vulnerabilities were found.[/bold green]")
 
@@ -168,7 +170,6 @@ async def main():
                 json.dump(unique_vulnerabilities, f, indent=4)
             console.print(f"[green][*] Scan report saved to {args.json_report}[/green]")
 
-        # Close all resources
         await browser.close()
 
 if __name__ == "__main__":
