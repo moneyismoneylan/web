@@ -17,7 +17,9 @@ from sqli_hunter.payloads import SQL_ERROR_PATTERNS
 from sqli_hunter.tamper import apply_tampers
 from sqli_hunter.ast_payload_generator import AstPayloadGenerator
 from sqli_hunter.bayesian_tamper_optimizer import BayesianTamperOptimizer, TAMPER_CATEGORIES
+from sqli_hunter.db_fingerprinter import BEHAVIORAL_PROBES
 from typing import Callable, Awaitable, Any, Tuple, List, Set, Dict
+from collections import defaultdict
 
 WAF_TEMPO_MAP = { "Cloudflare": 1.5, "AWS WAF": 0.5, "Imperva (Incapsula)": 1.0 }
 MAX_BACKOFF_DELAY = 60.0
@@ -162,34 +164,94 @@ class Scanner:
         """A more exhaustive, systematic scan for time-based vulnerabilities."""
         print("  [+] Running Exhaustive Time-Based scan...")
         sleep_time = 5
+        # We get the first payload generated, assuming it's a good generic one.
         payload, _ = self.payload_generator.generate("TIME_BASED", context, options={"sleep_time": sleep_time})[0]
 
-        # Level 1: Test all single tampers
-        for tamper in TAMPER_CATEGORIES:
-            if tamper == 'none': continue
-            chain = (tamper,)
-            tampered_payload = apply_tampers(payload, list(chain))
-            args = await create_request_args(tampered_payload)
-            _, duration, is_blocked = await self._send_headless_request(scraper, url, method, **args)
-            if not is_blocked and duration is not None and duration > baseline_median + (sleep_time * 0.8):
-                return payload, chain
+        # A set of tamper chains to test, starting with the most basic.
+        tampers_to_test = [('none',)] + \
+                          [(t,) for t in TAMPER_CATEGORIES if t != 'none'] + \
+                          list(itertools.combinations([t for t in TAMPER_CATEGORIES if t != 'none'], 2))
 
-        # Level 2: Test all combinations of 2 tampers
-        for chain in itertools.combinations(TAMPER_CATEGORIES, 2):
-            if 'none' in chain: continue
+        for chain in tampers_to_test:
             tampered_payload = apply_tampers(payload, list(chain))
             args = await create_request_args(tampered_payload)
             _, duration, is_blocked = await self._send_headless_request(scraper, url, method, **args)
+
             if not is_blocked and duration is not None and duration > baseline_median + (sleep_time * 0.8):
                 return payload, chain
 
         return None, None
 
 
+    async def _fingerprint_parameter(self, scraper: cloudscraper.CloudScraper, page: Page, url: str, method: str, create_request_args: Callable, original_value: str) -> str | None:
+        """
+        Sends behavioral probes to the target parameter and analyzes the responses to
+        determine the most likely database engine.
+        """
+        print(f"[*] Starting smart database fingerprinting for parameter...")
+        db_scores = defaultdict(int)
+
+        # Get a baseline response using a non-malicious value
+        baseline_args = await create_request_args(original_value)
+        baseline_body, baseline_duration, _ = await self._send_headless_request(scraper, url, method, **baseline_args)
+        if baseline_body is None:
+             # Fallback to browser request if headless fails for baseline
+             baseline_body, baseline_duration, _ = await self._send_browser_request(page, url, method, **baseline_args)
+
+        # If we can't even get a valid (non-empty) baseline, we can't fingerprint.
+        if not baseline_body:
+            print("[!] Could not retrieve a valid (non-empty) baseline response for fingerprinting. Aborting.")
+            return None
+
+        baseline_hash = Simhash(baseline_body)
+
+        for probe in BEHAVIORAL_PROBES:
+            # The payloads are crafted to be injected into a string context
+            args = await create_request_args(original_value + probe['payload'])
+            body, duration, is_blocked = await self._send_headless_request(scraper, url, method, **args, timeout=10)
+
+            if is_blocked: continue
+
+            was_successful = False
+            if body is not None and probe['type'] == 'time':
+                if duration > baseline_duration + (probe['validator'] * 0.7):
+                    was_successful = True
+            elif body is not None and probe['type'] == 'content':
+                if probe['validator'] and probe['validator'] in body:
+                    was_successful = True
+                elif probe['validator'] is None and body is not None:
+                     if Simhash(body).distance(baseline_hash) < 10:
+                          was_successful = True
+            elif body is not None and probe['type'] == 'error':
+                 if re.search(probe['validator'], body, re.IGNORECASE):
+                     was_successful = True
+
+            if was_successful:
+                db_scores[probe['db']] += 1
+                print(f"  [+] Hit for {probe['db']} (Type: {probe['type']})")
+
+        if not db_scores:
+            print("[-] Smart fingerprinting did not identify a database for this parameter.")
+            return None
+
+        most_likely_db = max(db_scores, key=db_scores.get)
+        print(f"[*] Fingerprinting finished. Scores: {dict(db_scores)}")
+        print(f"[+] Most likely database detected: {most_likely_db}")
+        return most_likely_db
+
     async def _run_scan_for_parameter(self, scraper: cloudscraper.CloudScraper, page: Page, url: str, method: str, param_name: str, original_value: str, baseline_median: float, baseline_hash: Simhash, collaborator_url: str, create_request_args: Callable):
         total_delay = self.static_request_delay
         if self.rate_limit_active: total_delay += self.rate_limit_delay
         if total_delay > 0: await asyncio.sleep(total_delay * random.uniform(0.8, 1.2))
+
+        # Fingerprint the parameter to determine the database type
+        db_type = await self._fingerprint_parameter(scraper, page, url, method, create_request_args, original_value)
+        if not db_type:
+            print(f"  [!] Could not determine database for param '{param_name}', skipping.")
+            return
+
+        # Instantiate the payload generator with the detected dialect
+        self.payload_generator = AstPayloadGenerator(dialect=db_type)
 
         context = await self._perform_taint_analysis(page, url, method, lambda taint: create_request_args(original_value + taint))
         print(f"  [*] Taint Analysis for param '{param_name}' found reflection context: {context}")
@@ -269,8 +331,7 @@ class Scanner:
                 return {'data': {**base_data, param_name: p_value}}
             await self._run_scan_for_parameter(scraper, page, url, method, param_name, input_to_test.get("value", ""), baseline_median, baseline_hash, collaborator_url, create_form_request_args)
 
-    async def scan_target(self, target_item: dict, collaborator_url: str | None = None, db_type: str | None = None):
-        self.payload_generator = AstPayloadGenerator(dialect=db_type)
+    async def scan_target(self, target_item: dict, collaborator_url: str | None = None):
         scraper = cloudscraper.create_scraper()
 
         cookies = await self.context.cookies()
