@@ -16,7 +16,6 @@ from sqli_hunter.crawler import Crawler
 from sqli_hunter.scanner import Scanner
 from sqli_hunter.exploiter import Exploiter
 from sqli_hunter.waf_detector import WafDetector
-from sqli_hunter.db_fingerprinter import DbFingerprinter
 
 SCANNER_WORKERS = 10
 
@@ -36,14 +35,14 @@ def deduplicate_vulnerabilities(vulnerabilities: list) -> list:
             seen_signatures.add(signature)
     return unique_vulns
 
-async def scanner_worker(queue: asyncio.Queue, scanner: Scanner, collaborator_url: str | None, db_type: str | None):
+async def scanner_worker(queue: asyncio.Queue, scanner: Scanner, collaborator_url: str | None):
     while True:
         target_item = await queue.get()
         if target_item is None: break
         try:
             # Circuit breaker: Timeout for each scan target to prevent stalls
             await asyncio.wait_for(
-                scanner.scan_target(target_item, collaborator_url, db_type),
+                scanner.scan_target(target_item, collaborator_url),
                 timeout=600.0  # 10-minute timeout per target
             )
         except asyncio.TimeoutError:
@@ -95,12 +94,10 @@ async def main():
         queue = asyncio.Queue()
         waf_detector = WafDetector(context)
         waf_name = await waf_detector.check_waf(args.url)
-        db_fingerprinter = DbFingerprinter(context)
-        db_type = await db_fingerprinter.detect_db(args.url)
 
         canary_store = {}
         scanner = Scanner(context, canary_store=canary_store, waf_name=waf_name, n_calls=args.n_calls)
-        scanner_tasks = [asyncio.create_task(scanner_worker(queue, scanner, args.collaborator, db_type)) for _ in range(SCANNER_WORKERS)]
+        scanner_tasks = [asyncio.create_task(scanner_worker(queue, scanner, args.collaborator)) for _ in range(SCANNER_WORKERS)]
 
         if args.retest:
             console.print(f"\n[bold cyan]--- Running in Re-test Mode using {args.retest} ---[/bold cyan]")
