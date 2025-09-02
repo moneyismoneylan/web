@@ -11,3 +11,5 @@ numpy # scikit-optimize requires numpy
 playwright-stealth
 curl_cffi
 cloudscraper
+PyQt6
+PyQt6-sip

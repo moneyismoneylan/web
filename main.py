@@ -41,10 +41,9 @@ async def scanner_worker(queue: asyncio.Queue, scanner: Scanner, collaborator_ur
         target_item = await queue.get()
         if target_item is None: break
         try:
-            # Circuit breaker: Timeout for each scan target to prevent stalls
             await asyncio.wait_for(
                 scanner.scan_target(target_item, collaborator_url),
-                timeout=600.0  # 10-minute timeout per target
+                timeout=600.0
             )
         except asyncio.TimeoutError:
             url = target_item.get("url", "Unknown Target")
@@ -55,25 +54,18 @@ async def scanner_worker(queue: asyncio.Queue, scanner: Scanner, collaborator_ur
         finally:
             queue.task_done()
 
-async def main():
-    parser = argparse.ArgumentParser(description="SQLi Hunter - An Advanced SQLi DAST Tool")
-    parser.add_argument("-u", "--url", required=True, help="The target URL to scan")
-    parser.add_argument("-d", "--depth", type=int, default=3, help="The depth for the crawler to explore.")
-    parser.add_argument("--no-crawl", action="store_true", help="Disable the crawler and only scan the provided URL.")
-    parser.add_argument("--collaborator", help="Your Out-of-Band server URL.")
-    parser.add_argument("--dump-db", action="store_true", help="Attempt to extract the database name.")
-    parser.add_argument("--cookie", help="The session cookie to use for authenticated scans (e.g., 'name=value').")
-    parser.add_argument("--json-report", help="Save the scan results to a JSON file.")
-    parser.add_argument("--n-calls", type=int, default=25, help="Number of Bayesian Optimizer calls per parameter (higher is more thorough).")
-    parser.add_argument("--retest", help="Run in regression mode using a previous JSON report.")
-    parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging of requests and responses.")
-
-    args = parser.parse_args()
+async def run_scan_logic(args: dict):
+    """The core logic of the scanner, refactored to be callable from other modules."""
     console = Console()
-    display_banner(console)
+    url = args.get("url")
+    if not url:
+        console.print("[red]URL is a required argument.[/red]")
+        return
 
-    if not urlparse(args.url).scheme: args.url = "http://" + args.url
-    console.print(f"[bold green][*] Target URL:[/] [link={args.url}]{args.url}[/link]")
+    if not urlparse(url).scheme:
+        url = "http://" + url
+
+    console.print(f"[bold green][*] Target URL:[/] [link={url}]{url}[/link]")
 
     async with Stealth().use_async(async_playwright()) as p:
         browser = await p.chromium.launch()
@@ -83,57 +75,52 @@ async def main():
             locale='en-US',
             timezone_id='America/New_York'
         )
-        if args.cookie:
+        if args.get("cookie"):
             try:
-                name, value = args.cookie.split('=', 1)
-                await context.add_cookies([{"name": name.strip(), "value": value.strip(), "domain": urlparse(args.url).netloc}])
+                name, value = args["cookie"].split('=', 1)
+                await context.add_cookies([{"name": name.strip(), "value": value.strip(), "domain": urlparse(url).netloc}])
                 console.print("[green][*] Session cookie set.[/green]")
             except ValueError:
                 console.print("[red][!] Invalid cookie format. Please use 'name=value'.[/red]")
 
         queue = asyncio.Queue()
-
-        # Create a single, shared cloudscraper instance
         scraper = cloudscraper.create_scraper()
-
         waf_detector = WafDetector(context, scraper)
-        waf_name = await waf_detector.check_waf(args.url)
+        waf_name = await waf_detector.check_waf(url)
 
         canary_store = {}
-        scanner = Scanner(context, scraper, canary_store=canary_store, waf_name=waf_name, n_calls=args.n_calls, debug=args.debug)
-        scanner_tasks = [asyncio.create_task(scanner_worker(queue, scanner, args.collaborator)) for _ in range(SCANNER_WORKERS)]
+        scanner = Scanner(context, scraper, canary_store=canary_store, waf_name=waf_name, n_calls=args.get("n_calls", 25), debug=args.get("debug", False))
+        scanner_tasks = [asyncio.create_task(scanner_worker(queue, scanner, args.get("collaborator"))) for _ in range(SCANNER_WORKERS)]
 
-        if args.retest:
-            console.print(f"\n[bold cyan]--- Running in Re-test Mode using {args.retest} ---[/bold cyan]")
+        if args.get("retest"):
+            console.print(f"\n[bold cyan]--- Running in Re-test Mode using {args['retest']} ---[/bold cyan]")
             try:
-                with open(args.retest, 'r') as f:
+                with open(args['retest'], 'r') as f:
                     previous_vulns = json.load(f)
-
                 urls_to_test = {vuln['url'] for vuln in previous_vulns}
-                for url in urls_to_test:
-                    await queue.put({"type": "url", "url": url, "method": "GET"})
+                for u in urls_to_test:
+                    await queue.put({"type": "url", "url": u, "method": "GET"})
                 console.print(f"[*] Queued {len(urls_to_test)} unique URLs for re-testing.")
-
             except (IOError, json.JSONDecodeError) as e:
                 console.print(f"[bold red][!] Error reading re-test file: {e}[/bold red]")
                 return
-        elif args.no_crawl:
+        elif args.get("no_crawl"):
             console.print("[yellow][!] Crawler disabled. Scanning only the provided URL.[/yellow]")
-            await queue.put({"type": "url", "url": args.url, "method": "GET"})
+            await queue.put({"type": "url", "url": url, "method": "GET"})
         else:
             console.print("\n[bold cyan]--- Starting Concurrent Crawl & Scan ---[/bold cyan]")
-            crawler = Crawler(base_url=args.url, max_depth=args.depth, queue=queue, browser_context=context)
+            crawler = Crawler(base_url=url, max_depth=args.get("depth", 3), queue=queue, browser_context=context)
             await crawler.start()
 
         await queue.join()
         for _ in range(SCANNER_WORKERS): await queue.put(None)
         await asyncio.gather(*scanner_tasks)
 
-        if canary_store and args.collaborator:
+        if canary_store and args.get("collaborator"):
             console.print("\n[bold cyan]--- Verifying Stored SQLi Canaries ---[/bold cyan]")
             resolver = dns.asyncresolver.Resolver()
             for canary_id, sink_info in canary_store.items():
-                domain_to_check = f"{canary_id}.stored.{args.collaborator}"
+                domain_to_check = f"{canary_id}.stored.{args['collaborator']}"
                 try:
                     await resolver.resolve(domain_to_check, 'A')
                     vuln_info = {"url": sink_info['url'], "type": "Stored SQLi (via OAST)", "parameter": sink_info['param'], "payload": f"Canary {canary_id} triggered."}
@@ -153,10 +140,8 @@ async def main():
             for vuln in unique_vulnerabilities:
                 table.add_row(vuln['url'], vuln.get('parameter', 'N/A'), vuln['type'], str(vuln['payload']))
             console.print(table)
-            if args.dump_db:
-                # For now, we only have a reliable dumper for MSSQL Error-Based vulns
+            if args.get("dump_db"):
                 error_based_vuln = next((v for v in unique_vulnerabilities if "Error-Based" in v['type'] and v.get('dialect') == 'mssql'), None)
-
                 if error_based_vuln:
                     exploiter = Exploiter(context)
                     await exploiter.extract_data(error_based_vuln)
@@ -165,12 +150,34 @@ async def main():
         else:
             console.print("\n[bold green][-] No vulnerabilities were found.[/bold green]")
 
-        if args.json_report:
-            with open(args.json_report, 'w') as f:
+        if args.get("json_report"):
+            with open(args["json_report"], 'w') as f:
                 json.dump(unique_vulnerabilities, f, indent=4)
-            console.print(f"[green][*] Scan report saved to {args.json_report}[/green]")
+            console.print(f"[green][*] Scan report saved to {args['json_report']}[/green]")
 
         await browser.close()
 
+def main():
+    parser = argparse.ArgumentParser(description="SQLi Hunter - An Advanced SQLi DAST Tool")
+    parser.add_argument("-u", "--url", help="The target URL to scan")
+    parser.add_argument("-d", "--depth", type=int, default=3, help="The depth for the crawler to explore.")
+    parser.add_argument("--no-crawl", action="store_true", help="Disable the crawler and only scan the provided URL.")
+    parser.add_argument("--collaborator", help="Your Out-of-Band server URL.")
+    parser.add_argument("--dump-db", action="store_true", help="Attempt to extract the database name.")
+    parser.add_argument("--cookie", help="The session cookie to use for authenticated scans (e.g., 'name=value').")
+    parser.add_argument("--json-report", help="Save the scan results to a JSON file.")
+    parser.add_argument("--n-calls", type=int, default=25, help="Number of Bayesian Optimizer calls per parameter (higher is more thorough).")
+    parser.add_argument("--retest", help="Run in regression mode using a previous JSON report.")
+    parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging of requests and responses.")
+    args = parser.parse_args()
+
+    if not args.url:
+        # This will be handled by the GUI, but for CLI, it's an error.
+        parser.error("the following arguments are required: -u/--url")
+
+    console = Console()
+    display_banner(console)
+    asyncio.run(run_scan_logic(vars(args)))
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
