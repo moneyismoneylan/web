@@ -223,7 +223,7 @@ class Scanner:
                      if Simhash(body).distance(baseline_hash) < 10:
                           was_successful = True
             elif body is not None and probe['type'] == 'error':
-                 if re.search(probe['validator'], body, re.IGNORECASE):
+                 if re.search(probe['validator'], body):
                      was_successful = True
 
             if was_successful:
