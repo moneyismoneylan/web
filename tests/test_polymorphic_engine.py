@@ -1,0 +1,13 @@
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from sqli_hunter.polymorphic_engine import PolymorphicEngine
+
+
+def test_grammar_and_taint():
+    engine = PolymorphicEngine(max_transformations=1)
+    grammar = {"<field>": ["username", "password"], "<id>": ["1", "2"]}
+    taint = {"<field>": "email"}
+    payloads = engine.generate("SELECT <field> FROM users WHERE id=<id>", num_variations=1, grammar=grammar, taint_map=taint)
+    assert any("email" in p for p in payloads)

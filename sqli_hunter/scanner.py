@@ -20,6 +20,8 @@ from sqli_hunter.tamper import apply_tampers
 from sqli_hunter.ast_payload_generator import AstPayloadGenerator
 from sqli_hunter.bayesian_tamper_optimizer import BayesianTamperOptimizer, TAMPER_CATEGORIES
 from sqli_hunter.db_fingerprinter import BEHAVIORAL_PROBES
+from sqli_hunter.ml_classifier import LSTMAnomalyClassifier
+import sqlglot
 from typing import Callable, Awaitable, Any, Tuple, List, Set, Dict
 from collections import defaultdict
 from rich.console import Console
@@ -54,6 +56,7 @@ class Scanner:
         self.n_calls = n_calls
         if self.static_request_delay > 0: print(f"[*] WAF policy adaptation: Applying a {self.static_request_delay}s delay between requests.")
         self.signature_automaton = self._build_signature_automaton()
+        self.ml_classifier = LSTMAnomalyClassifier()
 
     def _build_signature_automaton(self) -> ahocorasick.Automaton | None:
         automaton = ahocorasick.Automaton()
@@ -166,7 +169,24 @@ class Scanner:
                 elif "postgresql" in pattern: inferred_dialect = "postgresql"
                 elif "sqlsrv" in pattern: inferred_dialect = "mssql"
                 break
+
+        # AST extraction and ML scoring
+        for fragment in self._extract_sql_fragments(response_body):
+            try:
+                ast = sqlglot.parse_one(fragment)
+                ml_score = self.ml_classifier.score(ast)
+                anomaly_score += ml_score * 0.3
+                if self.debug and ml_score > 0:
+                    print(f"    [bold yellow]Debug: ML score {ml_score:.2f} for fragment: {fragment}")
+            except Exception:
+                continue
+
         return min(anomaly_score, 1.0), inferred_dialect
+
+    def _extract_sql_fragments(self, text: str) -> List[str]:
+        """Extract potential SQL snippets from response text."""
+        pattern = re.compile(r"(select|insert|update|delete|union)[^;]+", re.IGNORECASE)
+        return [m.group(0) for m in pattern.finditer(text)]
 
     async def _confirm_boolean_anomaly(self, url, method, create_request_args, context) -> bool:
         """Sends true/false payloads to confirm a suspected boolean-based vulnerability."""

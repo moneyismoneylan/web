@@ -6,6 +6,7 @@ This module is responsible for generating variations of a base payload
 to evade signature-based WAFs.
 """
 import random
+from typing import Dict, List
 from sqli_hunter.tamper import TAMPER_FUNCTIONS
 
 class PolymorphicEngine:
@@ -16,12 +17,26 @@ class PolymorphicEngine:
         self.max_transformations = max_transformations
         self.tamper_functions = list(TAMPER_FUNCTIONS.values())
 
-    def generate(self, base_payload: str, num_variations: int = 10) -> list[str]:
-        """
-        Generates a list of polymorphic variations for a given base payload.
+    def _apply_grammar(self, payload: str, grammar: Dict[str, List[str]], taint_map: Dict[str, str] | None) -> str:
+        """Replaces grammar tokens in the payload using provided grammar rules and
+        optional taint analysis results."""
+        if not grammar:
+            return payload
+        for token, expansions in grammar.items():
+            while token in payload:
+                replacement = taint_map.get(token) if taint_map and token in taint_map else random.choice(expansions)
+                payload = payload.replace(token, replacement, 1)
+        return payload
 
-        :param base_payload: The base payload to transform.
-        :param num_variations: The number of variations to generate.
+    def generate(self, base_payload: str, num_variations: int = 10, grammar: Dict[str, List[str]] | None = None,
+                 taint_map: Dict[str, str] | None = None) -> list[str]:
+        """Generates polymorphic variations for a given base payload.
+
+        :param base_payload: The base payload to transform. It may contain grammar
+            tokens such as <expr> that will be expanded using the grammar rules.
+        :param num_variations: Number of variations to generate.
+        :param grammar: Optional grammar rules for fuzzing.
+        :param taint_map: Optional taint analysis results overriding grammar choices.
         :return: A list of transformed payloads.
         """
         variations = set()
@@ -29,7 +44,7 @@ class PolymorphicEngine:
             num_transformations = random.randint(1, self.max_transformations)
             selected_tampers = random.sample(self.tamper_functions, num_transformations)
 
-            transformed_payload = base_payload
+            transformed_payload = self._apply_grammar(base_payload, grammar or {}, taint_map)
             for tamper in selected_tampers:
                 transformed_payload = tamper(transformed_payload)
 
