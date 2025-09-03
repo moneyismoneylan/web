@@ -17,3 +17,11 @@ def test_gan_generation():
     engine = PolymorphicEngine(max_transformations=1)
     payloads = engine.generate("UNION SELECT 1", num_variations=1, use_gan=True)
     assert len(payloads) >= 1
+
+
+def test_llm_prompted_mutation_fallback():
+    engine = PolymorphicEngine(max_transformations=1)
+    payloads = engine.generate(
+        "UNION SELECT 1", num_variations=1, use_llm=True, prompt="mutate"
+    )
+    assert len(payloads) >= 1
