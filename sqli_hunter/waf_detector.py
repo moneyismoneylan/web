@@ -21,6 +21,17 @@ try:  # Optional TLS fingerprinting dependency
 except Exception:  # pragma: no cover - library may be missing
     ja3 = None  # type: ignore
 
+try:  # Optional graph dependencies
+    import networkx as nx  # type: ignore
+    from torch_geometric.utils import from_networkx  # type: ignore
+    from torch_geometric.nn import TransformerConv  # type: ignore
+    import torch
+except Exception:  # pragma: no cover - heavy deps absent
+    nx = None  # type: ignore
+    from_networkx = None  # type: ignore
+    TransformerConv = None  # type: ignore
+    torch = None  # type: ignore
+
 
 class GradientBoostClassifier:
     """Very small gradient-boosting-like classifier.
@@ -54,8 +65,40 @@ class GradientBoostClassifier:
 
 
 # A database of WAF signatures loaded from configuration.
-WAF_SIGNATURES = load_config("waf_signatures")
+WAF_SIGNATURES = load_config("waf_fingerprints")
 BOOST_MODEL = GradientBoostClassifier()
+
+
+class GraphNNEvaluator:
+    """Very small GNN scorer combining features into a graph."""
+
+    def __init__(self) -> None:
+        if nx and TransformerConv and torch:  # pragma: no cover - optional
+            try:
+                self.model = TransformerConv(1, 1, heads=1)
+            except Exception:
+                self.model = None
+        else:
+            self.model = None
+
+    def predict(self, features: dict) -> float:
+        if not (self.model and nx and from_networkx and torch):
+            return 0.0
+        g = nx.Graph()
+        for idx, (k, v) in enumerate(features.items()):
+            g.add_node(idx, label=k, value=float(len(str(v))))
+            if idx:
+                g.add_edge(idx - 1, idx)
+        try:  # pragma: no cover - optional
+            data = from_networkx(g)
+            x = torch.ones((g.number_of_nodes(), 1))
+            out = self.model(x, data.edge_index)
+            return float(out.mean().abs().item())
+        except Exception:
+            return 0.0
+
+
+GNN_EVALUATOR = GraphNNEvaluator()
 
 MALICIOUS_PROBE_URL = "/?s=<script>alert('XSS')</script>"
 
@@ -106,7 +149,11 @@ class WafDetector:
                 return waf_name
 
         features = {"headers": headers, "cookies": cookie_names, "body": body, "ja3": ja3_hash}
-        return BOOST_MODEL.predict(features, WAF_SIGNATURES)
+        gnn_score = GNN_EVALUATOR.predict(features)
+        prediction = BOOST_MODEL.predict(features, WAF_SIGNATURES)
+        if prediction and (GNN_EVALUATOR.model is None or gnn_score >= 0.1):
+            return prediction
+        return None
 
     async def _transfer_cookies_to_browser_context(self, scraper: cloudscraper.CloudScraper, url: str):
         """Transfers cookies from cloudscraper to the Playwright browser context."""
@@ -125,9 +172,10 @@ class WafDetector:
         if cookies_to_add:
             await self.context.add_cookies(cookies_to_add)
 
-    async def check_waf(self, base_url: str) -> str | None:
+    async def check_waf(self, base_url: str, report_file: str = "waf_report.json") -> str | None:
         """Probes the target to identify the WAF using a headless client."""
         print("[*] Starting WAF fingerprinting...")
+        waf_name = None
 
         try:
             response = await asyncio.to_thread(self.scraper.get, base_url, timeout=15)
@@ -135,20 +183,30 @@ class WafDetector:
             waf_name = self._check_signatures_headless(response, self.scraper.cookies)
             if waf_name:
                 print(f"[+] WAF Detected on initial request: {waf_name}")
-                return waf_name
         except Exception:
             pass
 
-        probe_url = base_url.rstrip('/') + MALICIOUS_PROBE_URL
+        if not waf_name:
+            probe_url = base_url.rstrip('/') + MALICIOUS_PROBE_URL
+            try:
+                response = await asyncio.to_thread(self.scraper.get, probe_url, timeout=15)
+                await self._transfer_cookies_to_browser_context(self.scraper, probe_url)
+                waf_name = self._check_signatures_headless(response, self.scraper.cookies)
+                if waf_name:
+                    print(f"[+] WAF Detected after malicious probe: {waf_name}")
+            except Exception:
+                pass
+
+        if not waf_name:
+            print("[-] No specific WAF detected.")
+
+        # Persist a small JSON report for the orchestrator/GUI layer.
         try:
-            response = await asyncio.to_thread(self.scraper.get, probe_url, timeout=15)
-            await self._transfer_cookies_to_browser_context(self.scraper, probe_url)
-            waf_name = self._check_signatures_headless(response, self.scraper.cookies)
-            if waf_name:
-                print(f"[+] WAF Detected after malicious probe: {waf_name}")
-                return waf_name
+            import json
+
+            with open(report_file, "w", encoding="utf-8") as f:
+                json.dump({"waf": waf_name}, f, indent=2)
         except Exception:
             pass
 
-        print("[-] No specific WAF detected.")
-        return None
+        return waf_name
