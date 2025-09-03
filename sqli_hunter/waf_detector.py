@@ -16,38 +16,46 @@ import cloudscraper
 from urllib.parse import urlparse
 from sqli_hunter.bootstrap import load_config
 
+try:  # Optional TLS fingerprinting dependency
+    import ja3
+except Exception:  # pragma: no cover - library may be missing
+    ja3 = None  # type: ignore
 
-class WAFBehaviorGNN:
-    """Simplified GNN-like model for WAF behaviour.
 
-    The model builds a graph of response features (headers, cookies, body
-    tokens) and computes a naive score for each WAF. It is intentionally
-    lightweight and does not require external ML libraries.
+class GradientBoostClassifier:
+    """Very small gradient-boosting-like classifier.
+
+    This is **not** a real gradient boosting implementation.  It simply
+    aggregates feature matches with different weights.  The class mirrors the
+    interface of scikit-learn's estimators so that it can be swapped out with a
+    proper model when running in a full environment.
     """
 
     def predict(self, features: dict, signatures: dict) -> str | None:
-        best_name, best_score = None, 0
+        best_name, best_score = None, 0.0
         for waf_name, sig in signatures.items():
-            score = 0
+            score = 0.0
             for header, pattern in sig.get("headers", {}).items():
                 if header.lower() in features["headers"] and re.search(
                     pattern, features["headers"][header.lower()], re.IGNORECASE
                 ):
-                    score += 1
+                    score += 1.0
             for cookie in sig.get("cookies", []):
                 if any(c.startswith(cookie) for c in features["cookies"]):
-                    score += 1
+                    score += 1.0
             for pattern in sig.get("body", []):
                 if re.search(pattern, features["body"], re.IGNORECASE):
-                    score += 1
+                    score += 1.0
+            if sig.get("ja3") and sig.get("ja3") == features.get("ja3"):
+                score += 2.0  # TLS fingerprints are strong signals
             if score > best_score:
                 best_name, best_score = waf_name, score
-        return best_name if best_score >= 2 else None
+        return best_name if best_score >= 2.0 else None
 
 
 # A database of WAF signatures loaded from configuration.
 WAF_SIGNATURES = load_config("waf_signatures")
-GNN_MODEL = WAFBehaviorGNN()
+BOOST_MODEL = GradientBoostClassifier()
 
 MALICIOUS_PROBE_URL = "/?s=<script>alert('XSS')</script>"
 
@@ -59,12 +67,9 @@ class WafDetector:
         self.context = browser_context
         self.scraper = scraper
 
-    def _check_signatures_headless(self, response, cookies) -> str | None:
-        """Compares response headers, cookies, and body against the WAF signature DB.
+    def _check_signatures_headless(self, response, cookies, ja3_hash: str | None = None) -> str | None:
+        """Compare response/tls features against the WAF signature DB."""
 
-        If no direct signature matches are found, a lightweight GNN model is
-        used to infer the most probable WAF based on the observed features.
-        """
         if not response:
             return None
 
@@ -75,20 +80,17 @@ class WafDetector:
         for waf_name, signatures in WAF_SIGNATURES.items():
             matches = 0
 
-            # Check headers
             for header, pattern in signatures.get("headers", {}).items():
                 header_lower = header.lower()
                 if header_lower in headers and re.search(pattern, headers[header_lower], re.IGNORECASE):
                     matches += 1
                     break
 
-            # Check cookies
             for cookie_pattern in signatures.get("cookies", []):
                 if any(c.startswith(cookie_pattern) for c in cookie_names):
                     matches += 1
                     break
 
-            # Check body
             body_patterns = signatures.get("body")
             if body_patterns:
                 for p in body_patterns:
@@ -96,13 +98,15 @@ class WafDetector:
                         matches += 1
                         break
 
+            if signatures.get("ja3") and ja3_hash and signatures["ja3"] == ja3_hash:
+                matches += 1
+
             min_matches = signatures.get("min_matches", 2)
             if matches >= min_matches:
                 return waf_name
 
-        # Fall back to the GNN model
-        features = {"headers": headers, "cookies": cookie_names, "body": body}
-        return GNN_MODEL.predict(features, WAF_SIGNATURES)
+        features = {"headers": headers, "cookies": cookie_names, "body": body, "ja3": ja3_hash}
+        return BOOST_MODEL.predict(features, WAF_SIGNATURES)
 
     async def _transfer_cookies_to_browser_context(self, scraper: cloudscraper.CloudScraper, url: str):
         """Transfers cookies from cloudscraper to the Playwright browser context."""

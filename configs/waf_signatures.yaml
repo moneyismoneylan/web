@@ -84,3 +84,10 @@ ModSecurity:
   - mod.security.rules triggered
   - access denied by security policy
   min_matches: 2
+
+TestJA3:
+  headers: {}
+  cookies: []
+  body: []
+  ja3: "abcd1234"
+  min_matches: 1
