@@ -20,6 +20,7 @@ from sqli_hunter.ast_payload_generator import AstPayloadGenerator
 from sqli_hunter.bayesian_tamper_optimizer import BayesianTamperOptimizer, TAMPER_CATEGORIES
 from sqli_hunter.db_fingerprinter import BEHAVIORAL_PROBES
 from sqli_hunter.ml_classifier import LSTMAnomalyClassifier
+from sqli_hunter.polymorphic_engine import PolymorphicEngine
 import sqlglot
 from typing import Callable, Awaitable, Any, Tuple, List, Set, Dict
 from collections import defaultdict
@@ -28,9 +29,10 @@ from rich.panel import Panel
 import json
 try:  # Optional dependencies used for graph-based analysis
     import networkx as nx
-    from torch_geometric.nn import TransformerConv  # type: ignore
-    from torch_geometric.utils import from_networkx  # type: ignore
+    from torch_geometric.nn import TransformerConv
+    from torch_geometric.utils import from_networkx
     import torch
+    import zmq
 except Exception:  # pragma: no cover - tests run without heavy deps
     nx = None  # type: ignore
     TransformerConv = None  # type: ignore
@@ -161,44 +163,102 @@ class SideChannelCalibrator:
         return max(0.0, duration - self.jitter)
 
 
-class SideChannelLSTMAnalyzer:
-    """Analyzes timing/plan side channels using a tiny LSTM with attention."""
+class MockEbpfAgent:
+    """Mocks an eBPF agent that would normally be running in the kernel.
 
-    def __init__(self) -> None:
-        self.model = None
-        if torch:  # pragma: no cover - heavy dep optional
-            try:
-                import torch.nn as nn  # type: ignore
+    In a real-world scenario, this would use a library like bcc or libbpf
+    to attach to kernel probes and collect data. For this simulation, it
+    generates synthetic data.
+    """
+    def __init__(self):
+        self.baseline_syscalls = random.randint(50, 150)
+        self.baseline_jitter = random.uniform(0.0001, 0.001)
 
-                class _Net(nn.Module):
-                    def __init__(self) -> None:
-                        super().__init__()
-                        self.lstm = nn.LSTM(input_size=2, hidden_size=4, batch_first=True)
-                        self.attn = nn.Linear(4, 1)
+    def read_metrics(self, is_anomalous: bool = False) -> Tuple[float, int]:
+        """Returns a tuple of (CPU jitter, syscall count)."""
+        if is_anomalous:
+            # Anomalous requests often trigger more syscalls (e.g., for error handling, logging)
+            # and can cause more CPU jitter due to cache misses or context switching.
+            jitter = self.baseline_jitter * random.uniform(1.5, 3.0)
+            syscalls = self.baseline_syscalls + random.randint(20, 50)
+        else:
+            jitter = self.baseline_jitter * random.uniform(0.9, 1.1)
+            syscalls = self.baseline_syscalls + random.randint(-5, 5)
+        return jitter, syscalls
 
-                    def forward(self, x):
-                        out, _ = self.lstm(x)
-                        w = self.attn(out).squeeze(-1)
-                        w = w.softmax(dim=1)
-                        return (out.norm(dim=2) * w).sum(dim=1)
 
-                self.model = _Net()
-            except Exception:
-                self.model = None
+class VAEAnomalyScorer(torch.nn.Module if torch else object):
+    """
+    A Variational Autoencoder (VAE) for detecting anomalies in side-channel data.
 
-    def score(self, seq: list[tuple[float, float]]) -> float:
-        """Return a score in [0,1] given a sequence of (time, plan_flag)."""
-        if not self.model:
+    It learns a compressed representation of normal system behavior (CPU jitter,
+    syscall counts) and flags inputs with high reconstruction error as anomalous.
+    """
+    def __init__(self, input_dim=2, latent_dim=2):
+        if not torch:
+            self.is_trained = False
+            return
+        super(VAEAnomalyScorer, self).__init__()
+
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, 8),
+            torch.nn.ReLU(),
+            torch.nn.Linear(8, 4),
+            torch.nn.ReLU(),
+        )
+        self.fc_mu = torch.nn.Linear(4, latent_dim)
+        self.fc_logvar = torch.nn.Linear(4, latent_dim)
+        self.decoder = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, 4),
+            torch.nn.ReLU(),
+            torch.nn.Linear(4, 8),
+            torch.nn.ReLU(),
+            torch.nn.Linear(8, input_dim),
+            torch.nn.Sigmoid() # Assuming normalized inputs
+        )
+        # NOTE: In a real application, this model would be pre-trained on
+        # baseline data from the target application.
+        self.is_trained = True # Mocking a trained state
+
+    def encode(self, x):
+        h = self.encoder(x)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x.view(-1, 2))
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+    def score(self, metrics: Tuple[float, int]) -> float:
+        """
+        Calculates the anomaly score based on reconstruction error.
+        A score closer to 1.0 indicates a higher probability of being an anomaly.
+        """
+        if not (torch and self.is_trained):
             return 0.0
-        try:  # pragma: no cover - optional path
-            import torch
+        # Normalize metrics to be in a similar range, e.g., [0, 1]
+        # These normalization factors would be determined during calibration.
+        norm_jitter = min(metrics[0] * 1000, 1.0) # e.g. scale 0.001 to 1.0
+        norm_syscalls = min(metrics[1] / 200.0, 1.0) # e.g. scale 200 to 1.0
 
-            tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
-            out = self.model(tensor)
-            value = float(out.item())
-            return min(abs(value) % 1.0, 1.0)
-        except Exception:
-            return 0.0
+        input_tensor = torch.tensor([norm_jitter, norm_syscalls], dtype=torch.float32)
+
+        with torch.no_grad():
+            recon, _, _ = self.forward(input_tensor)
+            recon_error = torch.nn.functional.mse_loss(recon, input_tensor.view(-1, 2))
+
+        # Scale the error to a [0, 1] range. The max_error would be a calibrated value.
+        max_error = 0.1
+        anomaly_score = min(recon_error.item() / max_error, 1.0)
+        return anomaly_score
 
 
 class DistributedScanner:
@@ -219,7 +279,7 @@ class DistributedScanner:
 
     async def worker(self, handler: Callable[[dict], Awaitable[None]]) -> None:
         if self._zasyncio:
-            sock = self._ctx.socket(self._zasyncio.PULL)
+            sock = self._ctx.socket(zmq.PULL)
             sock.bind(self.endpoint)
             while True:
                 task = await sock.recv_json()
@@ -231,7 +291,7 @@ class DistributedScanner:
 
     async def submit(self, task: dict) -> None:
         if self._zasyncio:
-            sock = self._ctx.socket(self._zasyncio.PUSH)
+            sock = self._ctx.socket(zmq.PUSH)
             sock.connect(self.endpoint)
             await sock.send_json(task)
         else:
@@ -248,7 +308,7 @@ class Scanner:
         "' OR 1=1#", "' OR 1=1-- ", "' OR 'x'='x",
     ]
 
-    def __init__(self, browser_context: BrowserContext, scraper: cloudscraper.CloudScraper, canary_store: Dict, waf_name: str | None = None, n_calls: int = 20, debug: bool = False, adv_tamper: bool = False):
+    def __init__(self, browser_context: BrowserContext, scraper: cloudscraper.CloudScraper, canary_store: Dict, waf_name: str | None = None, n_calls: int = 20, debug: bool = False, adv_tamper: bool = False, use_diffusion: bool = False, use_llm_mutator: bool = False):
         self.context = browser_context
         self.scraper = scraper
         self.debug = debug
@@ -261,8 +321,10 @@ class Scanner:
         self.rate_limit_active = False
         self.rate_limit_delay = 1.0
         self.successful_requests_since_rl = 0
-        self.payload_generator = AstPayloadGenerator(dialect="mysql") # Defaulting to mysql, can be updated later
+        self.payload_generator = AstPayloadGenerator(dialect="mysql")
         self.adv_tamper = adv_tamper
+        self.use_diffusion = use_diffusion
+        self.use_llm_mutator = use_llm_mutator
         self.n_calls = n_calls
         if self.static_request_delay > 0: print(f"[*] WAF policy adaptation: Applying a {self.static_request_delay}s delay between requests.")
         self.signature_automaton = self._build_signature_automaton()
@@ -270,7 +332,8 @@ class Scanner:
         self.transformer_analyzer = TransformerQueryAnalyzer()
         self.graph_scorer = GraphTransformerScorer()
         self.calibrator = SideChannelCalibrator()
-        self.side_channel_analyzer = SideChannelLSTMAnalyzer()
+        self.ebpf_agent = MockEbpfAgent()
+        self.side_channel_analyzer = VAEAnomalyScorer()
 
     def _build_signature_automaton(self) -> ahocorasick.Automaton | None:
         automaton = ahocorasick.Automaton()
@@ -355,6 +418,8 @@ class Scanner:
         response_body: str,
         baseline_time: float | None = None,
         response_time: float | None = None,
+        ebpf_metrics: Tuple[float, int] | None = None,
+        graph_score: float | None = None,
     ) -> tuple[float, str | None]:
         """
         Analyzes a response against a baseline and returns an anomaly score (0.0 to 1.0)
@@ -372,14 +437,19 @@ class Scanner:
         hash_distance = baseline_hash.distance(Simhash(response_body))
         simhash_score = min(hash_distance / 64.0, 1.0)
 
-        # Timing side-channel analysed via LSTM/attention model
+        # Timing side-channel
         if baseline_time is not None and response_time is not None:
             base_norm = self.calibrator.normalize(baseline_time)
             resp_norm = self.calibrator.normalize(response_time)
-            lstm_score = self.side_channel_analyzer.score([(base_norm, 0.0), (resp_norm, 1.0)])
-            other_score += lstm_score
             if resp_norm > base_norm * 1.5:
                 other_score += 0.2
+
+        # eBPF-based side-channel analysis using VAE
+        if ebpf_metrics:
+            vae_score = self.side_channel_analyzer.score(ebpf_metrics)
+            other_score += vae_score * 0.4 # Weight the VAE score
+            if self.debug:
+                print(f"    [bold yellow]Debug: eBPF metrics: (jitter: {ebpf_metrics[0]:.6f}, syscalls: {ebpf_metrics[1]}). VAE score: {vae_score:.2f}")
 
         # Query-plan side-channel: look for tell-tale plan keywords
         plan_hit = re.search(r"(seq scan|index scan|query plan)", response_body, re.IGNORECASE)
@@ -412,20 +482,26 @@ class Scanner:
                     inferred_dialect = "mssql"
                 break
 
-        # AST extraction and ML scoring
+        # AST extraction and ML scoring from response
         for fragment in self._extract_sql_fragments(response_body):
             try:
                 ast = sqlglot.parse_one(fragment)
                 ml_score = self.ml_classifier.score(ast)
                 transformer_score = self.transformer_analyzer.score(fragment)
-                graph_score = self.graph_scorer.score(ast)
-                model_score += ml_score * 0.5 + transformer_score * 0.3 + graph_score * 0.2
-                if self.debug and (ml_score > 0 or transformer_score > 0 or graph_score > 0):
+                graph_score_from_response = self.graph_scorer.score(ast)
+                model_score += ml_score * 0.5 + transformer_score * 0.3 + graph_score_from_response * 0.2
+                if self.debug and (ml_score > 0 or transformer_score > 0 or graph_score_from_response > 0):
                     print(
-                        f"    [bold yellow]Debug: ML {ml_score:.2f} / TF {transformer_score:.2f} / GT {graph_score:.2f} for fragment: {fragment}"
+                        f"    [bold yellow]Debug: ML {ml_score:.2f} / TF {transformer_score:.2f} / GT {graph_score_from_response:.2f} for fragment: {fragment}"
                     )
             except Exception:
                 continue
+
+        # Add score from outgoing payload's AST graph
+        if graph_score:
+            model_score += graph_score * 0.3 # Add payload graph score, weighted
+            if self.debug:
+                print(f"    [bold yellow]Debug: Payload AST graph score: {graph_score:.2f}")
 
         combined = other_score + 0.5 * regex_score + 0.3 * simhash_score + 0.2 * model_score
         return min(combined, 1.0), inferred_dialect
@@ -456,14 +532,44 @@ class Scanner:
         """Fuzzes a parameter, scores responses for anomalies, and confirms vulnerabilities."""
         print(f"  [*] Fuzzing for anomalies on param '{param_name}'...")
         fuzz_string = "sqlihunter"
-        for payload in self.QUICK_SCAN_PAYLOADS:
+
+        # Generate payloads: start with basics and add advanced ones if enabled
+        payloads_to_test = list(self.QUICK_SCAN_PAYLOADS)
+        if self.use_diffusion or self.use_llm_mutator:
+            print(f"  [*] Generating advanced payloads (Diffusion: {self.use_diffusion}, LLM: {self.use_llm_mutator})")
+            poly_engine = PolymorphicEngine()
+            advanced_payloads = poly_engine.generate(
+                "' OR 1=1 --",
+                num_variations=20,
+                use_diffusion=self.use_diffusion,
+                use_llm=self.use_llm_mutator,
+                prompt="Create a tricky SQL injection payload"
+            )
+            payloads_to_test.extend(advanced_payloads)
+            print(f"  [*] Testing with {len(payloads_to_test)} total payloads.")
+
+        for payload in payloads_to_test:
+            # Generate a score for the payload's AST complexity before sending
+            graph_score = 0.0
+            try:
+                payload_ast = sqlglot.parse_one(payload, read="mysql")
+                if payload_ast:
+                    graph_score = self.graph_scorer.score(payload_ast)
+            except Exception:
+                pass # Ignore payloads that can't be parsed
+
             for injected_value in [original_value + payload, fuzz_string + payload, payload]:
                 final_request_args = await create_request_args(injected_value)
                 body, duration, is_blocked, status = await self._send_headless_request(url, method, **final_request_args)
                 if is_blocked or not body: continue
 
+                # Simulate eBPF data collection for the request
+                is_anomalous_probe = any(p in injected_value for p in self.QUICK_SCAN_PAYLOADS)
+                ebpf_metrics = self.ebpf_agent.read_metrics(is_anomalous=is_anomalous_probe)
+
                 anomaly_score, inferred_dialect = self._analyze_response_for_anomalies(
-                    baseline_status, baseline_hash, status, body, baseline_time, duration
+                    baseline_status, baseline_hash, status, body, baseline_time, duration,
+                    ebpf_metrics=ebpf_metrics, graph_score=graph_score
                 )
 
                 if anomaly_score >= ANOMALY_CONFIRMATION_THRESHOLD:

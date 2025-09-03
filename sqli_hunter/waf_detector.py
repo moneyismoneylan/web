@@ -12,9 +12,20 @@ from __future__ import annotations
 from playwright.async_api import BrowserContext, Error
 import re
 import asyncio
+import time
+import ssl
 import cloudscraper
 from urllib.parse import urlparse
 from sqli_hunter.bootstrap import load_config
+from h2.config import H2Configuration
+from h2.connection import H2Connection
+from h2.events import (
+    ResponseReceived,
+    DataReceived,
+    RemoteSettingsChanged,
+    StreamEnded,
+    ConnectionTerminated,
+)
 
 try:  # Optional TLS fingerprinting dependency
     import ja3
@@ -59,6 +70,19 @@ class GradientBoostClassifier:
                     score += 1.0
             if sig.get("ja3") and sig.get("ja3") == features.get("ja3"):
                 score += 2.0  # TLS fingerprints are strong signals
+
+            delay_threshold = sig.get("delay_threshold")
+            if delay_threshold and features.get("delay_ratio", 0) > delay_threshold:
+                score += 1.5  # Behavioral delay is a strong signal
+
+            # Check for specific HTTP/2 setting fingerprints
+            h2_sig_settings = sig.get("h2_settings", {})
+            h2_features = features.get("h2_features", {})
+            for setting_name, expected_value in h2_sig_settings.items():
+                if h2_features.get(setting_name.lower()) == expected_value:
+                    score += 2.0  # H2 settings are a very strong signal
+                    break  # One match is enough to score for H2
+
             if score > best_score:
                 best_name, best_score = waf_name, score
         return best_name if best_score >= 2.0 else None
@@ -100,6 +124,72 @@ class GraphNNEvaluator:
 
 GNN_EVALUATOR = GraphNNEvaluator()
 
+
+class H2Fingerprinter:
+    """A helper class to establish an HTTP/2 connection and fingerprint server settings."""
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.features = {}
+        self.connection_lost = asyncio.Future()
+        self.stream_ended = asyncio.Future()
+
+    async def run(self) -> dict:
+        try:
+            ssl_context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+            ssl_context.set_alpn_protocols(["h2"])
+
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port, ssl=ssl_context, server_hostname=self.host),
+                timeout=10.0
+            )
+
+            config = H2Configuration(client_side=True)
+            conn = H2Connection(config=config)
+            conn.initiate_connection()
+            writer.write(conn.data_to_send())
+            await writer.drain()
+
+            stream_id = conn.get_next_available_stream_id()
+            headers = [
+                (':method', 'GET'), (':authority', self.host), (':scheme', 'https'), (':path', '/'),
+                ('user-agent', 'Mozilla/5.0 H2Fingerprinter'),
+            ]
+            conn.send_headers(stream_id, headers, end_stream=True)
+            writer.write(conn.data_to_send())
+            await writer.drain()
+
+            while not self.stream_ended.done() and not self.connection_lost.done():
+                data = await asyncio.wait_for(reader.read(65535), timeout=5.0)
+                if not data: break
+                events = conn.receive_data(data)
+                for event in events:
+                    if isinstance(event, RemoteSettingsChanged):
+                        for param, value in event.changed_settings.items():
+                            self.features[param.name.lower()] = value
+                    elif isinstance(event, StreamEnded):
+                        self.stream_ended.set_result(True)
+                    elif isinstance(event, ConnectionTerminated):
+                        self.connection_lost.set_result(True)
+
+                if conn.data_to_send:
+                    writer.write(conn.data_to_send())
+                    await writer.drain()
+
+        except Exception as e:
+            # Don't log common errors like timeouts as they are expected
+            if not isinstance(e, (asyncio.TimeoutError, ConnectionResetError, OSError)):
+                print(f"[!] H2 fingerprinting failed for {self.host}: {type(e).__name__}")
+        finally:
+            if 'writer' in locals() and not writer.is_closing():
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception: pass
+
+        return self.features
+
+
 MALICIOUS_PROBE_URL = "/?s=<script>alert('XSS')</script>"
 
 
@@ -110,47 +200,15 @@ class WafDetector:
         self.context = browser_context
         self.scraper = scraper
 
-    def _check_signatures_headless(self, response, cookies, ja3_hash: str | None = None) -> str | None:
+    def _predict_waf(self, features: dict) -> str | None:
         """Compare response/tls features against the WAF signature DB."""
-
-        if not response:
+        if not features.get("body"):
             return None
 
-        headers = {k.lower(): v for k, v in response.headers.items()}
-        cookie_names = {c.name for c in cookies}
-        body = response.text
-
-        for waf_name, signatures in WAF_SIGNATURES.items():
-            matches = 0
-
-            for header, pattern in signatures.get("headers", {}).items():
-                header_lower = header.lower()
-                if header_lower in headers and re.search(pattern, headers[header_lower], re.IGNORECASE):
-                    matches += 1
-                    break
-
-            for cookie_pattern in signatures.get("cookies", []):
-                if any(c.startswith(cookie_pattern) for c in cookie_names):
-                    matches += 1
-                    break
-
-            body_patterns = signatures.get("body")
-            if body_patterns:
-                for p in body_patterns:
-                    if re.search(p, body, re.IGNORECASE):
-                        matches += 1
-                        break
-
-            if signatures.get("ja3") and ja3_hash and signatures["ja3"] == ja3_hash:
-                matches += 1
-
-            min_matches = signatures.get("min_matches", 2)
-            if matches >= min_matches:
-                return waf_name
-
-        features = {"headers": headers, "cookies": cookie_names, "body": body, "ja3": ja3_hash}
         gnn_score = GNN_EVALUATOR.predict(features)
         prediction = BOOST_MODEL.predict(features, WAF_SIGNATURES)
+
+        # The GNN score can act as a confidence score for the prediction
         if prediction and (GNN_EVALUATOR.model is None or gnn_score >= 0.1):
             return prediction
         return None
@@ -160,44 +218,88 @@ class WafDetector:
         parsed_url = urlparse(url)
         cookies_to_add = []
         for cookie in scraper.cookies:
+            expires_timestamp = cookie.expires
+
+            # Ensure expires_timestamp is a valid integer or -1
+            if expires_timestamp is None:
+                expires_timestamp = -1
+            elif not isinstance(expires_timestamp, (int, float)):
+                try:
+                    # Handle string-based timestamps
+                    expires_timestamp = int(float(str(expires_timestamp)))
+                except (ValueError, TypeError):
+                    # Default to a session cookie on any conversion failure
+                    expires_timestamp = -1
+
             cookies_to_add.append({
                 "name": cookie.name,
                 "value": cookie.value,
                 "domain": cookie.domain or parsed_url.netloc,
                 "path": cookie.path or "/",
-                "expires": cookie.expires,
+                "expires": int(expires_timestamp),
                 "httpOnly": cookie.has_nonstandard_attr('HttpOnly'),
                 "secure": cookie.secure,
             })
         if cookies_to_add:
-            await self.context.add_cookies(cookies_to_add)
+            try:
+                await self.context.add_cookies(cookies_to_add)
+            except Error as e:
+                print(f"[Warning] Could not set cookies for Playwright context: {e}")
+
+    async def _analyze_http2_frames(self, host: str, port: int) -> dict:
+        """Analyzes HTTP/2 frames for WAF signatures."""
+        fingerprinter = H2Fingerprinter(host, port)
+        return await fingerprinter.run()
 
     async def check_waf(self, base_url: str, report_file: str = "waf_report.json") -> str | None:
         """Probes the target to identify the WAF using a headless client."""
         print("[*] Starting WAF fingerprinting...")
         waf_name = None
 
+        # 1. Benign request to get baseline
+        start_time_benign = time.monotonic()
         try:
-            response = await asyncio.to_thread(self.scraper.get, base_url, timeout=15)
+            response_benign = await asyncio.to_thread(self.scraper.get, base_url, timeout=15)
             await self._transfer_cookies_to_browser_context(self.scraper, base_url)
-            waf_name = self._check_signatures_headless(response, self.scraper.cookies)
-            if waf_name:
-                print(f"[+] WAF Detected on initial request: {waf_name}")
+        except Exception as e:
+            print(f"[!] Initial request to {base_url} failed: {e}")
+            return None
+        duration_benign = time.monotonic() - start_time_benign
+
+        # 2. Malicious probe request
+        probe_url = base_url.rstrip('/') + MALICIOUS_PROBE_URL
+        start_time_malicious = time.monotonic()
+        try:
+            response_malicious = await asyncio.to_thread(self.scraper.get, probe_url, timeout=15)
+            await self._transfer_cookies_to_browser_context(self.scraper, probe_url)
         except Exception:
-            pass
+            response_malicious = response_benign # Fallback to benign if probe fails
+        duration_malicious = time.monotonic() - start_time_malicious
 
-        if not waf_name:
-            probe_url = base_url.rstrip('/') + MALICIOUS_PROBE_URL
-            try:
-                response = await asyncio.to_thread(self.scraper.get, probe_url, timeout=15)
-                await self._transfer_cookies_to_browser_context(self.scraper, probe_url)
-                waf_name = self._check_signatures_headless(response, self.scraper.cookies)
-                if waf_name:
-                    print(f"[+] WAF Detected after malicious probe: {waf_name}")
-            except Exception:
-                pass
+        # 3. Calculate behavioral and protocol features
+        delay_ratio = duration_malicious / duration_benign if duration_benign > 0 else 0.0
 
-        if not waf_name:
+        parsed_url = urlparse(base_url)
+        host = parsed_url.netloc
+        port = parsed_url.port or 443
+        h2_features = await self._analyze_http2_frames(host, port)
+
+        # 4. Assemble features and predict
+        if response_malicious:
+            features = {
+                "headers": {k.lower(): v for k, v in response_malicious.headers.items()},
+                "cookies": {c.name for c in self.scraper.cookies},
+                "body": response_malicious.text,
+                "ja3": None,
+                "delay_ratio": delay_ratio,
+                "h2_features": h2_features,
+                "h3_features": {},
+            }
+            waf_name = self._predict_waf(features)
+
+        if waf_name:
+            print(f"[+] WAF Detected: {waf_name} (Delay Ratio: {delay_ratio:.2f})")
+        else:
             print("[-] No specific WAF detected.")
 
         # Persist a small JSON report for the orchestrator/GUI layer.

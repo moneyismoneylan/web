@@ -43,12 +43,23 @@ def comment_around_keywords(payload: str) -> str:
 
 
 TAMPER_FUNCTIONS = {
-    'space2comment': space_to_comment, 'randomcase': random_case, 'urlencode': plus_url_encode,
-    'chardoubleencode': char_double_encode, 'equaltolike': equal_to_like, 'space2randomblank': space_to_random_blank,
-    'versionedkeywords': versioned_keywords, 'keywordsubstitution': keyword_substitution, 'hexencodekeywords': hex_encode_keywords,
-    'addnullbyte': add_null_byte, 'splitkeywords': split_keywords_by_comment, 'functionsynonyms': function_synonyms,
+    'space2comment': space_to_comment,
+    'randomcase': random_case,
+    # 'urlencode': plus_url_encode,  # Disabled: Playwright handles URL encoding.
+    # 'chardoubleencode': char_double_encode,  # Disabled: Produces invalid payloads.
+    'equaltolike': equal_to_like,
+    # 'space2randomblank': space_to_random_blank,  # Disabled: Playwright handles URL encoding.
+    'versionedkeywords': versioned_keywords,
+    'keywordsubstitution': keyword_substitution,
+    # 'hexencodekeywords': hex_encode_keywords,  # Disabled: Avoid manual encoding.
+    # 'addnullbyte': add_null_byte,  # Disabled: Playwright handles URL encoding.
+    'splitkeywords': split_keywords_by_comment,
+    'functionsynonyms': function_synonyms,
     'commentaroundkeywords': comment_around_keywords,
 }
+
+# All encoding tampers are disabled, so exclusive groups are no longer needed.
+MUTUALLY_EXCLUSIVE_TAMPERS = []
 
 def apply_tampers(payload: str, tamper_list: list[str]) -> str:
     """Applies a list of tamper scripts to a payload sequentially."""

@@ -14,7 +14,7 @@ def test_orchestrator_collects_metrics(tmp_path):
         await o.send_metric({"v": 1})
 
     orchestrator = DistributedOrchestrator(report_file=str(report))
-    metrics = asyncio.run(orchestrator.run([agent], duration=0.01))
+    metrics = asyncio.run(orchestrator.run([agent]))
     assert metrics == [{"v": 1}]
     data = json.loads(report.read_text())
     assert data == [{"v": 1}]

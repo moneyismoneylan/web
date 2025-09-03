@@ -15,3 +15,18 @@ PyQt6
 PyQt6-sip
 pyahocorasick
 PyYAML
+
+# Added for advanced features
+torch
+torchvision
+torchaudio
+torch_geometric
+transformers
+stable-baselines3[extra]
+pyzmq
+ray
+qiskit
+scikit-learn
+h2
+aioquic
+websockets

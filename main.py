@@ -184,6 +184,8 @@ def main():
     parser.add_argument("--retest", help="Run in regression mode using a previous JSON report.")
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug logging of requests and responses.")
     parser.add_argument("--adv-tamper", action="store_true", help="Enable advanced AST-based payload tampering (AdvSQLi).")
+    parser.add_argument("--use-diffusion", action="store_true", help="Use the diffusion model to generate payload variations.")
+    parser.add_argument("--use-llm-mutator", action="store_true", help="Use an LLM to mutate payloads.")
     args = parser.parse_args()
 
     if not args.url:
