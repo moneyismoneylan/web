@@ -10,13 +10,14 @@ from typing import Dict, List
 from sqli_hunter.tamper import TAMPER_FUNCTIONS
 
 
-class GANPayloadGenerator:
-    """Very small GAN-like generator for payload seeds.
+class Seq2SeqGANPayloadGenerator:
+    """Toy seq2seq GAN used to diversify grammar-based fuzzing.
 
-    The class keeps a ``feedback`` string that mimics information flowing from
-    a taint analysis module.  In a full implementation the feedback would be
-    used to train a neural network.  Here we simply append it to the payload
-    before shuffling characters so that unit tests can verify the feedback loop.
+    The generator accepts feedback strings (e.g. from taint analysis) and
+    simply mixes them into the payload before shuffling characters.  The goal
+    is to emulate how a seq2seq GAN might learn from data flow information
+    without pulling in heavyweight ML dependencies in the training
+    environment.
     """
 
     def __init__(self) -> None:
@@ -31,7 +32,7 @@ class GANPayloadGenerator:
         for _ in range(n):
             chars = list(base)
             random.shuffle(chars)
-            variations.append(''.join(chars))
+            variations.append("".join(chars))
         return variations
 
 class PolymorphicEngine:
@@ -71,7 +72,7 @@ class PolymorphicEngine:
         :return: A list of transformed payloads.
         """
         variations = set()
-        gan = GANPayloadGenerator() if use_gan else None
+        gan = Seq2SeqGANPayloadGenerator() if use_gan else None
         if gan and taint_map:
             gan.train(str(taint_map))
         for _ in range(num_variations):
