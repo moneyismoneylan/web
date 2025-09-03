@@ -15,9 +15,9 @@ def test_grammar_and_taint():
     assert any("email" in p.lower() for p in payloads)
 
 
-def test_gan_generation():
+def test_diffusion_generation():
     engine = PolymorphicEngine(max_transformations=1)
-    payloads = engine.generate("UNION SELECT 1", num_variations=1, use_gan=True)
+    payloads = engine.generate("UNION SELECT 1", num_variations=1, use_diffusion=True)
     assert len(payloads) >= 1
 
 

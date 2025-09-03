@@ -31,6 +31,28 @@ def bootstrap_models() -> list[Any]:
     return models
 
 
+def validate_waf_fingerprints(data: Dict[str, Any]):
+    """Validates the structure of the WAF fingerprints file."""
+    if not isinstance(data, dict):
+        raise ValueError("WAF fingerprints file must be a dictionary.")
+
+    for waf_name, sig in data.items():
+        if not isinstance(sig, dict):
+            raise ValueError(f"Signature for '{waf_name}' must be a dictionary.")
+
+        allowed_keys = {"headers", "cookies", "body", "ja3", "min_matches", "delay_threshold", "h2_settings"}
+        for key in sig:
+            if key not in allowed_keys:
+                print(f"[Warning] Unknown key '{key}' in signature for '{waf_name}'.")
+
+        if "headers" in sig and not isinstance(sig["headers"], dict):
+            raise ValueError(f"headers for '{waf_name}' must be a dictionary.")
+        if "cookies" in sig and not isinstance(sig["cookies"], list):
+            raise ValueError(f"cookies for '{waf_name}' must be a list.")
+        if "body" in sig and not isinstance(sig["body"], list):
+            raise ValueError(f"body for '{waf_name}' must be a list.")
+
+
 def load_config(name: str) -> Dict[str, Any]:
     """Load a YAML or JSON configuration file from the config directory.
 
@@ -50,5 +72,14 @@ def load_config(name: str) -> Dict[str, Any]:
             data = json.load(f)
     else:
         data = {}
+
+    if name == "waf_fingerprints":
+        try:
+            validate_waf_fingerprints(data)
+        except ValueError as e:
+            print(f"[Error] Invalid WAF fingerprint configuration: {e}")
+            # Return an empty dict to prevent crashing, but log the error
+            data = {}
+
     _loaded_configs[name] = data
     return data
