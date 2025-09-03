@@ -9,6 +9,12 @@ import random
 from typing import Dict, List
 from sqli_hunter.tamper import TAMPER_FUNCTIONS
 
+try:  # Optional heavy dependency
+    from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
+except Exception:  # pragma: no cover
+    AutoTokenizer = None  # type: ignore
+    AutoModelForCausalLM = None  # type: ignore
+
 
 class Seq2SeqGANPayloadGenerator:
     """Toy seq2seq GAN used to diversify grammar-based fuzzing.
@@ -35,22 +41,62 @@ class Seq2SeqGANPayloadGenerator:
             variations.append("".join(chars))
         return variations
 
+
+class LLMPromptedMutator:
+    """Applies prompt-driven mutations using a tiny language model when available."""
+
+    def __init__(self) -> None:
+        self.tokenizer = None
+        self.model = None
+        if AutoTokenizer and AutoModelForCausalLM:  # pragma: no cover - optional
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    "distilgpt2", local_files_only=True
+                )
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    "distilgpt2", local_files_only=True
+                )
+            except Exception:
+                self.tokenizer = None
+                self.model = None
+
+    def mutate(self, prompt: str, payload: str) -> str:
+        if self.tokenizer and self.model:
+            try:  # pragma: no cover - heavy dependency path
+                import torch
+
+                inputs = self.tokenizer(prompt + payload, return_tensors="pt")
+                out = self.model.generate(
+                    **inputs, max_length=inputs["input_ids"].shape[1] + 8, do_sample=True
+                )
+                text = self.tokenizer.decode(out[0], skip_special_tokens=True)
+                return text[len(prompt):]
+            except Exception:
+                pass
+        return payload[::-1]
+
+
 class PolymorphicEngine:
-    """
-    Generates polymorphic variations of a given payload.
-    """
+    """Generates polymorphic variations of a given payload."""
+
     def __init__(self, max_transformations: int = 3):
         self.max_transformations = max_transformations
         self.tamper_functions = list(TAMPER_FUNCTIONS.values())
 
-    def _apply_grammar(self, payload: str, grammar: Dict[str, List[str]], taint_map: Dict[str, str] | None) -> str:
-        """Replaces grammar tokens in the payload using provided grammar rules and
-        optional taint analysis results."""
+    def _apply_grammar(
+        self,
+        payload: str,
+        grammar: Dict[str, List[str]],
+        taint_map: Dict[str, str] | None,
+    ) -> str:
+        """Replaces grammar tokens using grammar rules and optional taint map."""
         if not grammar:
             return payload
         for token, expansions in grammar.items():
             while token in payload:
-                replacement = taint_map.get(token) if taint_map and token in taint_map else random.choice(expansions)
+                replacement = (
+                    taint_map.get(token) if taint_map and token in taint_map else random.choice(expansions)
+                )
                 payload = payload.replace(token, replacement, 1)
         return payload
 
@@ -61,6 +107,8 @@ class PolymorphicEngine:
         grammar: Dict[str, List[str]] | None = None,
         taint_map: Dict[str, str] | None = None,
         use_gan: bool = False,
+        prompt: str | None = None,
+        use_llm: bool = False,
     ) -> list[str]:
         """Generates polymorphic variations for a given base payload.
 
@@ -73,6 +121,7 @@ class PolymorphicEngine:
         """
         variations = set()
         gan = Seq2SeqGANPayloadGenerator() if use_gan else None
+        llm = LLMPromptedMutator() if use_llm else None
         if gan and taint_map:
             gan.train(str(taint_map))
         for _ in range(num_variations):
@@ -82,6 +131,9 @@ class PolymorphicEngine:
             transformed_payload = self._apply_grammar(base_payload, grammar or {}, taint_map)
             for tamper in selected_tampers:
                 transformed_payload = tamper(transformed_payload)
+
+            if llm and prompt:
+                transformed_payload = llm.mutate(prompt, transformed_payload)
 
             variations.add(transformed_payload)
             if gan:
