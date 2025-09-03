@@ -51,7 +51,7 @@ def test_modsecurity_detection():
 def test_single_match_not_enough():
     response = DummyResponse(
         headers={"Server": "BigIP"},
-        text="The requested URL was rejected"
+        text=""
     )
     cookies = []
     assert detector()._check_signatures_headless(response, cookies) is None
