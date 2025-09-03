@@ -11,3 +11,9 @@ def test_grammar_and_taint():
     taint = {"<field>": "email"}
     payloads = engine.generate("SELECT <field> FROM users WHERE id=<id>", num_variations=1, grammar=grammar, taint_map=taint)
     assert any("email" in p for p in payloads)
+
+
+def test_gan_generation():
+    engine = PolymorphicEngine(max_transformations=1)
+    payloads = engine.generate("UNION SELECT 1", num_variations=1, use_gan=True)
+    assert len(payloads) >= 1

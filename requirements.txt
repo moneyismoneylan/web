@@ -14,3 +14,4 @@ cloudscraper
 PyQt6
 PyQt6-sip
 pyahocorasick
+PyYAML
