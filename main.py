@@ -155,12 +155,17 @@ async def run_scan_logic(args: dict, console: Console | None = None):
                 table.add_row(vuln['url'], vuln.get('parameter', 'N/A'), vuln['type'], str(vuln['payload']))
             console.print(table)
             if args.get("dump_db"):
-                error_based_vuln = next((v for v in unique_vulnerabilities if "Error-Based" in v['type'] and v.get('dialect') == 'mssql'), None)
-                if error_based_vuln:
+                # Prioritize error-based for speed, but support boolean-based
+                vuln_to_exploit = next((v for v in unique_vulnerabilities if "Error-Based" in v['type']), None)
+
+                if not vuln_to_exploit:
+                    vuln_to_exploit = next((v for v in unique_vulnerabilities if "Boolean-Based" in v['type']), None)
+
+                if vuln_to_exploit:
                     exploiter = Exploiter(context)
-                    await exploiter.extract_data(error_based_vuln)
+                    await exploiter.extract_data(vuln_to_exploit)
                 else:
-                    console.print("\n[yellow][!] --dump-db requires a supported vulnerability type (e.g., MSSQL Error-Based), none was found.[/yellow]")
+                    console.print("\n[yellow][!] --dump-db requires a supported vulnerability type (e.g., Error-Based, Boolean-Based), none was found.[/yellow]")
         else:
             console.print("\n[bold green][-] No vulnerabilities were found.[/bold green]")
 

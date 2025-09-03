@@ -56,7 +56,7 @@ class Crawler:
             page.on('request', self._handle_request)
 
             print(f"  [*] Navigating to {url} with Playwright...")
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=120000)
 
             # Simulate human-like mouse movements to evade behavioral bot detection
             try:

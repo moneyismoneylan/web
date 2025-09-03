@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import traceback
 import asyncio
 from playwright.async_api import BrowserContext, Page, Error
 import re
@@ -434,8 +435,14 @@ class Scanner:
             return 0.0, None
         if response_status != baseline_status:
             other_score += 0.5 if response_status >= 400 else 0.2
-        hash_distance = baseline_hash.distance(Simhash(response_body))
-        simhash_score = min(hash_distance / 64.0, 1.0)
+
+        try:
+            hash_distance = baseline_hash.distance(Simhash(response_body))
+            simhash_score = min(hash_distance / 64.0, 1.0)
+        except OverflowError:
+            if self.debug:
+                print("    [bold yellow]Debug: Simhash calculation failed due to an OverflowError. Skipping simhash score.[/bold yellow]")
+            simhash_score = 0.0
 
         # Timing side-channel
         if baseline_time is not None and response_time is not None:
@@ -488,7 +495,15 @@ class Scanner:
                 ast = sqlglot.parse_one(fragment)
                 ml_score = self.ml_classifier.score(ast)
                 transformer_score = self.transformer_analyzer.score(fragment)
-                graph_score_from_response = self.graph_scorer.score(ast)
+
+                graph_score_from_response = 0.0
+                try:
+                    if ast:
+                        graph_score_from_response = self.graph_scorer.score(ast)
+                except Exception as e:
+                    if self.debug:
+                        print(f"    [bold yellow]Debug: Graph scorer failed for fragment '{fragment[:50]}...': {e}[/bold yellow]")
+
                 model_score += ml_score * 0.5 + transformer_score * 0.3 + graph_score_from_response * 0.2
                 if self.debug and (ml_score > 0 or transformer_score > 0 or graph_score_from_response > 0):
                     print(
@@ -599,7 +614,16 @@ class Scanner:
                 args = await create_request_args(original_value + payload)
                 body, _, is_blocked, _ = await self._send_headless_request(url, method, **args)
                 if is_blocked or not body: continue
-                if baseline_hash and Simhash(body).distance(baseline_hash) > 5:
+                is_different = False
+                try:
+                    if baseline_hash and Simhash(body).distance(baseline_hash) > 5:
+                        is_different = True
+                except OverflowError:
+                    if self.debug:
+                        print("    [bold yellow]Debug: Simhash calculation failed during UNION scan. Assuming content is different.[/bold yellow]")
+                    is_different = True
+
+                if is_different:
                     column_count = i - 1
                     print(f"    [+] Potential column count found: {column_count} with prefix '{prefix}'")
                     prefix_used = prefix
@@ -649,7 +673,16 @@ class Scanner:
             false_body, _, is_blocked_false, _ = await self._send_headless_request(url, method, **false_args)
             if is_blocked_false or not false_body: continue
 
-            if Simhash(true_body).distance(Simhash(false_body)) > 5:
+            is_different = False
+            try:
+                if Simhash(true_body).distance(Simhash(false_body)) > 5:
+                    is_different = True
+            except OverflowError:
+                if self.debug:
+                    print("    [bold yellow]Debug: Simhash calculation failed during AST scan. Assuming content is different.[/bold yellow]")
+                is_different = True
+
+            if is_different:
                 vuln_type = "Boolean-Based SQLi (AST)"
                 if self.adv_tamper:
                     vuln_type += " (Tampered)"
