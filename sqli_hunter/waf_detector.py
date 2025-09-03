@@ -17,15 +17,21 @@ import ssl
 import cloudscraper
 from urllib.parse import urlparse
 from sqli_hunter.bootstrap import load_config
-from h2.config import H2Configuration
-from h2.connection import H2Connection
-from h2.events import (
-    ResponseReceived,
-    DataReceived,
-    RemoteSettingsChanged,
-    StreamEnded,
-    ConnectionTerminated,
-)
+
+try:  # Optional HTTP/2 support
+    from h2.config import H2Configuration  # type: ignore
+    from h2.connection import H2Connection  # type: ignore
+    from h2.events import (
+        ResponseReceived,
+        DataReceived,
+        RemoteSettingsChanged,
+        StreamEnded,
+        ConnectionTerminated,
+    )
+except Exception:  # pragma: no cover - library may be missing
+    H2Configuration = None  # type: ignore
+    H2Connection = None  # type: ignore
+    ResponseReceived = DataReceived = RemoteSettingsChanged = StreamEnded = ConnectionTerminated = None  # type: ignore
 
 try:  # Optional TLS fingerprinting dependency
     import ja3
@@ -135,6 +141,8 @@ class H2Fingerprinter:
         self.stream_ended = asyncio.Future()
 
     async def run(self) -> dict:
+        if not H2Connection or not H2Configuration:
+            return {}
         try:
             ssl_context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
             ssl_context.set_alpn_protocols(["h2"])
@@ -161,7 +169,8 @@ class H2Fingerprinter:
 
             while not self.stream_ended.done() and not self.connection_lost.done():
                 data = await asyncio.wait_for(reader.read(65535), timeout=5.0)
-                if not data: break
+                if not data:
+                    break
                 events = conn.receive_data(data)
                 for event in events:
                     if isinstance(event, RemoteSettingsChanged):
@@ -185,7 +194,8 @@ class H2Fingerprinter:
                 writer.close()
                 try:
                     await writer.wait_closed()
-                except Exception: pass
+                except Exception:
+                    pass
 
         return self.features
 
@@ -248,6 +258,8 @@ class WafDetector:
 
     async def _analyze_http2_frames(self, host: str, port: int) -> dict:
         """Analyzes HTTP/2 frames for WAF signatures."""
+        if not H2Connection or not H2Configuration:
+            return {}
         fingerprinter = H2Fingerprinter(host, port)
         return await fingerprinter.run()
 

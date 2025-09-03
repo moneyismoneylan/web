@@ -67,3 +67,9 @@ venv.bak
 *.swp
 *.swo
 *.swn
+
+# Runtime artifacts and local certificates
+exploit_cache.json
+waf_report.json
+cert.pem
+key.pem

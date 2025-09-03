@@ -32,35 +32,30 @@ try:  # Optional dependencies used for graph-based analysis
     from torch_geometric.nn import TransformerConv
     from torch_geometric.utils import from_networkx
     import torch
-    import zmq
 except Exception:  # pragma: no cover - tests run without heavy deps
     nx = None  # type: ignore
     TransformerConv = None  # type: ignore
     from_networkx = None  # type: ignore
     torch = None  # type: ignore
 
+try:  # Optional ZeroMQ dependency
+    import zmq
+except Exception:  # pragma: no cover - tests run without pyzmq
+    zmq = None  # type: ignore
+
 
 class TransformerQueryAnalyzer:
-    """Lightweight transformer-based semantic scorer.
+    """Lightweight semantic scorer.
 
-    In a full implementation this would load a pre-trained Transformer model
-    to assess whether extracted SQL fragments resemble malicious queries. To
-    keep dependencies small for the training environment, the default scorer
-    falls back to a simple token-based heuristic when no model is available.
+    Earlier iterations attempted to use Hugging Face transformers which
+    introduced heavyweight dependencies and required model downloads. The
+    analyzer now relies solely on a simple token based heuristic so it can
+    run in constrained environments without external resources.
     """
 
     def __init__(self) -> None:
-        try:  # pragma: no cover - heavy dependency, optional
-            from transformers import AutoTokenizer, AutoModel
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                "distilbert-base-uncased", local_files_only=True
-            )
-            self.model = AutoModel.from_pretrained(
-                "distilbert-base-uncased", local_files_only=True
-            )
-        except Exception:  # Transformer model not available
-            self.tokenizer = None
-            self.model = None
+        self.tokenizer = None
+        self.model = None
 
     def score(self, query: str) -> float:
         if self.tokenizer and self.model:
