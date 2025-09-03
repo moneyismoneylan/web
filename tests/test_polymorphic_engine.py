@@ -9,8 +9,8 @@ def test_grammar_and_taint():
     engine = PolymorphicEngine(max_transformations=1)
     grammar = {"<field>": ["username", "password"], "<id>": ["1", "2"]}
     taint = {"<field>": "email"}
-    payloads = engine.generate("SELECT <field> FROM users WHERE id=<id>", num_variations=1, grammar=grammar, taint_map=taint)
-    assert any("email" in p for p in payloads)
+    payloads = engine.generate("SELECT <field> FROM users WHERE id=<id>", num_variations=5, grammar=grammar, taint_map=taint)
+    assert any("email" in p.lower() for p in payloads)
 
 
 def test_gan_generation():

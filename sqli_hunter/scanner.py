@@ -25,6 +25,17 @@ from typing import Callable, Awaitable, Any, Tuple, List, Set, Dict
 from collections import defaultdict
 from rich.console import Console
 from rich.panel import Panel
+import json
+try:  # Optional dependencies used for graph-based analysis
+    import networkx as nx
+    from torch_geometric.nn import TransformerConv  # type: ignore
+    from torch_geometric.utils import from_networkx  # type: ignore
+    import torch
+except Exception:  # pragma: no cover - tests run without heavy deps
+    nx = None  # type: ignore
+    TransformerConv = None  # type: ignore
+    from_networkx = None  # type: ignore
+    torch = None  # type: ignore
 
 
 class TransformerQueryAnalyzer:
@@ -69,6 +80,86 @@ class TransformerQueryAnalyzer:
         overlap = sum(1 for t in tokens if t in suspicious)
         return overlap / len(tokens)
 
+
+class GraphTransformerScorer:
+    """Scores SQL ASTs using a lightweight graph transformer model.
+
+    When :mod:`torch_geometric` is available the AST is converted to a graph
+    and passed through a tiny :class:`TransformerConv` layer.  Otherwise a
+    simple structural heuristic based on the number of nodes/edges is used.
+    """
+
+    def __init__(self) -> None:
+        self.model = None
+        if nx and TransformerConv and torch:  # pragma: no cover - optional path
+            try:
+                self.model = TransformerConv(in_channels=1, out_channels=1, heads=1)
+            except Exception:
+                self.model = None
+
+    def _ast_to_graph(self, ast):
+        if not nx:
+            return None
+
+        graph = nx.DiGraph()
+
+        def _add(node, parent=None):
+            node_id = id(node)
+            graph.add_node(node_id, label=type(node).__name__)
+            if parent is not None:
+                graph.add_edge(parent, node_id)
+            # sqlglot AST nodes expose ``args`` attribute containing children
+            for child in getattr(node, "args", {}).values():
+                if isinstance(child, list):
+                    for c in child:
+                        if hasattr(c, "args"):
+                            _add(c, node_id)
+                elif hasattr(child, "args"):
+                    _add(child, node_id)
+
+        _add(ast)
+        return graph
+
+    def score(self, ast) -> float:
+        graph = self._ast_to_graph(ast)
+        if not graph:
+            return 0.0
+        if not self.model:
+            # Heuristic: more complex graphs -> higher score
+            max_size = 25.0
+            return min((graph.number_of_nodes() + graph.number_of_edges()) / max_size, 1.0)
+        try:  # pragma: no cover - optional path
+            data = from_networkx(graph)
+            x = torch.ones((graph.number_of_nodes(), 1))
+            out = self.model(x, data.edge_index)
+            score = float(out.mean().abs().item())
+            return min(score % 1.0, 1.0)
+        except Exception:
+            return 0.0
+
+
+class SideChannelCalibrator:
+    """Calibrates CPU time jitter and query-plan noise for side-channel checks."""
+
+    def __init__(self) -> None:
+        self.jitter = None
+
+    async def calibrate(self) -> None:
+        """Measure baseline CPU jitter by executing a tight loop asynchronously."""
+        samples = []
+        for _ in range(5):
+            start = time.perf_counter()
+            for _ in range(10000):
+                pass
+            samples.append(time.perf_counter() - start)
+            await asyncio.sleep(0)
+        self.jitter = sum(samples) / len(samples) if samples else 0.0
+
+    def normalize(self, duration: float) -> float:
+        if not self.jitter:
+            return duration
+        return max(0.0, duration - self.jitter)
+
 WAF_TEMPO_MAP = { "Cloudflare": 1.5, "AWS WAF": 0.5, "Imperva (Incapsula)": 1.0 }
 MAX_BACKOFF_DELAY = 60.0
 ANOMALY_CONFIRMATION_THRESHOLD = 0.8 # Score needed to trigger secondary analysis
@@ -100,6 +191,8 @@ class Scanner:
         self.signature_automaton = self._build_signature_automaton()
         self.ml_classifier = LSTMAnomalyClassifier()
         self.transformer_analyzer = TransformerQueryAnalyzer()
+        self.graph_scorer = GraphTransformerScorer()
+        self.calibrator = SideChannelCalibrator()
 
     def _build_signature_automaton(self) -> ahocorasick.Automaton | None:
         automaton = ahocorasick.Automaton()
@@ -166,6 +259,8 @@ class Scanner:
                 bodies.append(body)
                 statuses.append(status)
             await asyncio.sleep(0.5)
+        if self.calibrator.jitter is None:
+            await self.calibrator.calibrate()
         if not bodies:
             print("[!] Failed to establish a baseline. All baseline requests failed or were blocked.")
             return 500, 0.0, None, None
@@ -196,9 +291,11 @@ class Scanner:
         normalized_distance = min(hash_distance / 64.0, 1.0)
         anomaly_score += (normalized_distance * 0.4)
 
-        # Timing side-channel: significant increase over baseline indicates potential blind SQLi
+        # Timing side-channel: normalize values using calibration and check for delay
         if baseline_time is not None and response_time is not None:
-            if response_time > baseline_time * 1.5:
+            base_norm = self.calibrator.normalize(baseline_time)
+            resp_norm = self.calibrator.normalize(response_time)
+            if resp_norm > base_norm * 1.5:
                 anomaly_score += 0.2
 
         # Query-plan side-channel: look for tell-tale plan keywords
@@ -233,10 +330,11 @@ class Scanner:
                 ast = sqlglot.parse_one(fragment)
                 ml_score = self.ml_classifier.score(ast)
                 transformer_score = self.transformer_analyzer.score(fragment)
-                anomaly_score += ml_score * 0.3 + transformer_score * 0.2
-                if self.debug and (ml_score > 0 or transformer_score > 0):
+                graph_score = self.graph_scorer.score(ast)
+                anomaly_score += ml_score * 0.3 + transformer_score * 0.2 + graph_score * 0.1
+                if self.debug and (ml_score > 0 or transformer_score > 0 or graph_score > 0):
                     print(
-                        f"    [bold yellow]Debug: ML {ml_score:.2f} / TF {transformer_score:.2f} for fragment: {fragment}"
+                        f"    [bold yellow]Debug: ML {ml_score:.2f} / TF {transformer_score:.2f} / GT {graph_score:.2f} for fragment: {fragment}"
                     )
             except Exception:
                 continue
@@ -472,3 +570,22 @@ class Scanner:
             if not any(v['url'] == url and v['parameter'] == param for v in self.vulnerable_points):
                 self.console.print(Panel(json.dumps(vuln_info, indent=2), title="[bold red]Vulnerability Found!", expand=False))
                 self.vulnerable_points.append(vuln_info)
+
+    async def distributed_scan(self, targets: List[dict]) -> List[Any]:
+        """Coordinate distributed scanning using asyncio and optional ZeroMQ.
+
+        Each target dict is passed to :meth:`scan_target`.  When the
+        :mod:`zmq` library is available, a context is created to signal that the
+        system could distribute work across workers; in this simplified
+        implementation we still execute scans locally.
+        """
+
+        results = []
+        try:  # pragma: no cover - optional dependency
+            import zmq.asyncio  # type: ignore
+            _ = zmq.asyncio.Context.instance()
+        except Exception:
+            pass
+        for t in targets:
+            results.append(await self.scan_target(t))
+        return results

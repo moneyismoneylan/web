@@ -13,15 +13,23 @@ from sqli_hunter.tamper import TAMPER_FUNCTIONS
 class GANPayloadGenerator:
     """Very small GAN-like generator for payload seeds.
 
-    This is a stub implementation that emulates the interface of a GAN
-    without pulling in heavyweight deep learning frameworks. It simply
-    returns shuffled versions of the input to mimic generative behaviour.
+    The class keeps a ``feedback`` string that mimics information flowing from
+    a taint analysis module.  In a full implementation the feedback would be
+    used to train a neural network.  Here we simply append it to the payload
+    before shuffling characters so that unit tests can verify the feedback loop.
     """
+
+    def __init__(self) -> None:
+        self.feedback: str = ""
+
+    def train(self, feedback: str) -> None:
+        self.feedback = feedback
 
     def generate(self, payload: str, n: int = 1) -> List[str]:
         variations = []
+        base = payload + self.feedback
         for _ in range(n):
-            chars = list(payload)
+            chars = list(base)
             random.shuffle(chars)
             variations.append(''.join(chars))
         return variations
@@ -64,6 +72,8 @@ class PolymorphicEngine:
         """
         variations = set()
         gan = GANPayloadGenerator() if use_gan else None
+        if gan and taint_map:
+            gan.train(str(taint_map))
         for _ in range(num_variations):
             num_transformations = random.randint(1, self.max_transformations)
             selected_tampers = random.sample(self.tamper_functions, num_transformations)
