@@ -76,6 +76,21 @@ class LLMPromptedMutator:
         return payload[::-1]
 
 
+class QAOAOptimizer:
+    """Toy optimiser inspired by the QAOA algorithm.
+
+    In the real project this would interface with a quantum simulator to
+    search the payload space.  For the purposes of the kata the optimiser
+    simply chooses the longest payload as a stand-in for an objective
+    function that favours more complex inputs.
+    """
+
+    def select(self, payloads: List[str]) -> str:
+        if not payloads:
+            return ""
+        return max(payloads, key=len)
+
+
 class PolymorphicEngine:
     """Generates polymorphic variations of a given payload."""
 
@@ -140,3 +155,8 @@ class PolymorphicEngine:
                 variations.update(gan.generate(transformed_payload, 1))
 
         return list(variations)
+
+    def select_optimal(self, payloads: List[str]) -> str:
+        """Return the payload deemed optimal via the QAOA optimiser."""
+        optimizer = QAOAOptimizer()
+        return optimizer.select(payloads)
