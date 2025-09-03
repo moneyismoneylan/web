@@ -9,14 +9,7 @@ import random
 from typing import Dict, List
 from sqli_hunter.tamper import TAMPER_FUNCTIONS
 
-try:  # Optional heavy dependency
-    from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
-except Exception:  # pragma: no cover
-    AutoTokenizer = None  # type: ignore
-    AutoModelForCausalLM = None  # type: ignore
 
-
-import torch
 import numpy as np
 
 
@@ -102,37 +95,18 @@ class DiffusionPayloadGenerator:
 
 
 class LLMPromptedMutator:
-    """Applies prompt-driven mutations using a tiny language model when available."""
+    """Applies prompt-driven mutations using simple heuristics.
 
-    def __init__(self) -> None:
-        self.tokenizer = None
-        self.model = None
-        if AutoTokenizer and AutoModelForCausalLM:  # pragma: no cover - optional
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    "distilgpt2", local_files_only=True
-                )
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    "distilgpt2", local_files_only=True
-                )
-            except Exception:
-                self.tokenizer = None
-                self.model = None
+    The previous implementation attempted to call a small language model from
+    Hugging Face.  To avoid large downloads, mutations now rely on lightweight
+    deterministic transformations influenced by the provided prompt.
+    """
 
     def mutate(self, prompt: str, payload: str) -> str:
-        if self.tokenizer and self.model:
-            try:  # pragma: no cover - heavy dependency path
-                import torch
-
-                inputs = self.tokenizer(prompt + payload, return_tensors="pt")
-                out = self.model.generate(
-                    **inputs, max_length=inputs["input_ids"].shape[1] + 8, do_sample=True
-                )
-                text = self.tokenizer.decode(out[0], skip_special_tokens=True)
-                return text[len(prompt):]
-            except Exception:
-                pass
-        return payload[::-1]
+        if not payload:
+            return payload
+        shift = len(prompt) % len(payload)
+        return payload[shift:] + payload[:shift]
 
 
 try:

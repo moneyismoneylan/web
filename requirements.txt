@@ -21,7 +21,6 @@ torch
 torchvision
 torchaudio
 torch_geometric
-transformers
 stable-baselines3[extra]
 pyzmq
 ray
