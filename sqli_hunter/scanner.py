@@ -160,6 +160,83 @@ class SideChannelCalibrator:
             return duration
         return max(0.0, duration - self.jitter)
 
+
+class SideChannelLSTMAnalyzer:
+    """Analyzes timing/plan side channels using a tiny LSTM with attention."""
+
+    def __init__(self) -> None:
+        self.model = None
+        if torch:  # pragma: no cover - heavy dep optional
+            try:
+                import torch.nn as nn  # type: ignore
+
+                class _Net(nn.Module):
+                    def __init__(self) -> None:
+                        super().__init__()
+                        self.lstm = nn.LSTM(input_size=2, hidden_size=4, batch_first=True)
+                        self.attn = nn.Linear(4, 1)
+
+                    def forward(self, x):
+                        out, _ = self.lstm(x)
+                        w = self.attn(out).squeeze(-1)
+                        w = w.softmax(dim=1)
+                        return (out.norm(dim=2) * w).sum(dim=1)
+
+                self.model = _Net()
+            except Exception:
+                self.model = None
+
+    def score(self, seq: list[tuple[float, float]]) -> float:
+        """Return a score in [0,1] given a sequence of (time, plan_flag)."""
+        if not self.model:
+            return 0.0
+        try:  # pragma: no cover - optional path
+            import torch
+
+            tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
+            out = self.model(tensor)
+            value = float(out.item())
+            return min(abs(value) % 1.0, 1.0)
+        except Exception:
+            return 0.0
+
+
+class DistributedScanner:
+    """Very small asyncio/ZeroMQ based task distributor."""
+
+    def __init__(self, endpoint: str = "inproc://sqli-hunter") -> None:
+        self.endpoint = endpoint
+        try:  # pragma: no cover - optional dependency
+            import zmq.asyncio as zasyncio  # type: ignore
+
+            self._zasyncio = zasyncio
+            self._ctx = zasyncio.Context.instance()
+            self._queue = None
+        except Exception:
+            self._zasyncio = None
+            self._ctx = None
+            self._queue = asyncio.Queue()
+
+    async def worker(self, handler: Callable[[dict], Awaitable[None]]) -> None:
+        if self._zasyncio:
+            sock = self._ctx.socket(self._zasyncio.PULL)
+            sock.bind(self.endpoint)
+            while True:
+                task = await sock.recv_json()
+                await handler(task)
+        else:  # fallback for environments without ZeroMQ
+            while True:
+                task = await self._queue.get()
+                await handler(task)
+
+    async def submit(self, task: dict) -> None:
+        if self._zasyncio:
+            sock = self._ctx.socket(self._zasyncio.PUSH)
+            sock.connect(self.endpoint)
+            await sock.send_json(task)
+        else:
+            await self._queue.put(task)
+
 WAF_TEMPO_MAP = { "Cloudflare": 1.5, "AWS WAF": 0.5, "Imperva (Incapsula)": 1.0 }
 MAX_BACKOFF_DELAY = 60.0
 ANOMALY_CONFIRMATION_THRESHOLD = 0.8 # Score needed to trigger secondary analysis
@@ -193,6 +270,7 @@ class Scanner:
         self.transformer_analyzer = TransformerQueryAnalyzer()
         self.graph_scorer = GraphTransformerScorer()
         self.calibrator = SideChannelCalibrator()
+        self.side_channel_analyzer = SideChannelLSTMAnalyzer()
 
     def _build_signature_automaton(self) -> ahocorasick.Automaton | None:
         automaton = ahocorasick.Automaton()
@@ -282,46 +360,56 @@ class Scanner:
         Analyzes a response against a baseline and returns an anomaly score (0.0 to 1.0)
         and the dialect inferred from an error message, if any.
         """
-        anomaly_score = 0.0
+        other_score = 0.0
+        regex_score = 0.0
+        model_score = 0.0
+        simhash_score = 0.0
         inferred_dialect = None
-        if not response_body or not baseline_hash: return 0.0, None
+        if not response_body or not baseline_hash:
+            return 0.0, None
         if response_status != baseline_status:
-            anomaly_score += 0.5 if response_status >= 400 else 0.2
+            other_score += 0.5 if response_status >= 400 else 0.2
         hash_distance = baseline_hash.distance(Simhash(response_body))
-        normalized_distance = min(hash_distance / 64.0, 1.0)
-        anomaly_score += (normalized_distance * 0.4)
+        simhash_score = min(hash_distance / 64.0, 1.0)
 
-        # Timing side-channel: normalize values using calibration and check for delay
+        # Timing side-channel analysed via LSTM/attention model
         if baseline_time is not None and response_time is not None:
             base_norm = self.calibrator.normalize(baseline_time)
             resp_norm = self.calibrator.normalize(response_time)
+            lstm_score = self.side_channel_analyzer.score([(base_norm, 0.0), (resp_norm, 1.0)])
+            other_score += lstm_score
             if resp_norm > base_norm * 1.5:
-                anomaly_score += 0.2
+                other_score += 0.2
 
         # Query-plan side-channel: look for tell-tale plan keywords
-        if re.search(r"(seq scan|index scan|query plan)", response_body, re.IGNORECASE):
-            anomaly_score += 0.2
+        plan_hit = re.search(r"(seq scan|index scan|query plan)", response_body, re.IGNORECASE)
+        if plan_hit:
+            other_score += 0.2
 
         # Aho-Corasick attack signature detection
         if self.signature_automaton:
             found_patterns: Set[str] = set()
             for _, (pattern, weight) in self.signature_automaton.iter(response_body.lower()):
                 if pattern not in found_patterns:
-                    anomaly_score += weight
+                    regex_score += weight
                     found_patterns.add(pattern)
             if self.debug and found_patterns:
                 print(f"    [bold yellow]Debug: Signature matches:[/] {', '.join(found_patterns)}")
 
         # Check for classic SQL error patterns and infer dialect
-        # This is a simplified mapping. A more robust solution would use a more detailed map.
         for pattern in SQL_ERROR_PATTERNS:
             if re.search(pattern, response_body, re.IGNORECASE):
-                if self.debug: print(f"    [bold yellow]Debug: Found error pattern:[/] {pattern}")
-                anomaly_score += 0.9
-                if "mysql" in pattern: inferred_dialect = "mysql"
-                elif "ora-" in pattern: inferred_dialect = "oracle"
-                elif "postgresql" in pattern: inferred_dialect = "postgresql"
-                elif "sqlsrv" in pattern: inferred_dialect = "mssql"
+                if self.debug:
+                    print(f"    [bold yellow]Debug: Found error pattern:[/] {pattern}")
+                regex_score += 0.9
+                if "mysql" in pattern:
+                    inferred_dialect = "mysql"
+                elif "ora-" in pattern:
+                    inferred_dialect = "oracle"
+                elif "postgresql" in pattern:
+                    inferred_dialect = "postgresql"
+                elif "sqlsrv" in pattern:
+                    inferred_dialect = "mssql"
                 break
 
         # AST extraction and ML scoring
@@ -331,7 +419,7 @@ class Scanner:
                 ml_score = self.ml_classifier.score(ast)
                 transformer_score = self.transformer_analyzer.score(fragment)
                 graph_score = self.graph_scorer.score(ast)
-                anomaly_score += ml_score * 0.3 + transformer_score * 0.2 + graph_score * 0.1
+                model_score += ml_score * 0.5 + transformer_score * 0.3 + graph_score * 0.2
                 if self.debug and (ml_score > 0 or transformer_score > 0 or graph_score > 0):
                     print(
                         f"    [bold yellow]Debug: ML {ml_score:.2f} / TF {transformer_score:.2f} / GT {graph_score:.2f} for fragment: {fragment}"
@@ -339,7 +427,8 @@ class Scanner:
             except Exception:
                 continue
 
-        return min(anomaly_score, 1.0), inferred_dialect
+        combined = other_score + 0.5 * regex_score + 0.3 * simhash_score + 0.2 * model_score
+        return min(combined, 1.0), inferred_dialect
 
     def _extract_sql_fragments(self, text: str) -> List[str]:
         """Extract potential SQL snippets from response text."""
