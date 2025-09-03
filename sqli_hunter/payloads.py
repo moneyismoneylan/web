@@ -1,27 +1,16 @@
 # -*- coding: utf-8 -*-
 """Payload Manager.
 
-This module loads SQL injection payloads and error patterns from a JSON
-configuration file. Separating data from code simplifies updates and allows
-users to customise payload sets without touching the source code.
-"""
+This module loads SQL injection payloads and error patterns from an external
+configuration file via the bootstrap loader. Using configuration files allows
+the payload database to be updated without modifying source code."""
 from __future__ import annotations
 
-import json
-from pathlib import Path
 import re
+from sqli_hunter.bootstrap import load_config
 
 
-def _load_payload_config() -> dict:
-    path = Path(__file__).with_name("payload_config.json")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-_CONFIG = _load_payload_config()
+_CONFIG = load_config("payload_config")
 
 # A comprehensive list of common SQL error messages. Used to identify
 # potential error-based SQLi vulnerabilities.

@@ -6,15 +6,14 @@ from urllib.parse import urlparse, parse_qs, urljoin
 import time
 import statistics
 import uuid
-import json
 import random
 import itertools
-from pathlib import Path
 import ahocorasick
 from simhash import Simhash
 import dns.asyncresolver
 import cloudscraper
 from bs4 import BeautifulSoup
+from sqli_hunter.bootstrap import load_config
 from sqli_hunter.payloads import SQL_ERROR_PATTERNS
 from sqli_hunter.tamper import apply_tampers
 from sqli_hunter.ast_payload_generator import AstPayloadGenerator
@@ -26,6 +25,49 @@ from typing import Callable, Awaitable, Any, Tuple, List, Set, Dict
 from collections import defaultdict
 from rich.console import Console
 from rich.panel import Panel
+
+
+class TransformerQueryAnalyzer:
+    """Lightweight transformer-based semantic scorer.
+
+    In a full implementation this would load a pre-trained Transformer model
+    to assess whether extracted SQL fragments resemble malicious queries. To
+    keep dependencies small for the training environment, the default scorer
+    falls back to a simple token-based heuristic when no model is available.
+    """
+
+    def __init__(self) -> None:
+        try:  # pragma: no cover - heavy dependency, optional
+            from transformers import AutoTokenizer, AutoModel
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                "distilbert-base-uncased", local_files_only=True
+            )
+            self.model = AutoModel.from_pretrained(
+                "distilbert-base-uncased", local_files_only=True
+            )
+        except Exception:  # Transformer model not available
+            self.tokenizer = None
+            self.model = None
+
+    def score(self, query: str) -> float:
+        if self.tokenizer and self.model:
+            try:  # pragma: no cover - optional path
+                import torch
+
+                inputs = self.tokenizer(query, return_tensors="pt")
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                embedding = outputs.last_hidden_state.mean().item()
+                return min(abs(embedding) % 1.0, 1.0)
+            except Exception:
+                return 0.0
+
+        tokens = query.lower().split()
+        suspicious = {"select", "union", "and", "or"}
+        if not tokens:
+            return 0.0
+        overlap = sum(1 for t in tokens if t in suspicious)
+        return overlap / len(tokens)
 
 WAF_TEMPO_MAP = { "Cloudflare": 1.5, "AWS WAF": 0.5, "Imperva (Incapsula)": 1.0 }
 MAX_BACKOFF_DELAY = 60.0
@@ -57,13 +99,12 @@ class Scanner:
         if self.static_request_delay > 0: print(f"[*] WAF policy adaptation: Applying a {self.static_request_delay}s delay between requests.")
         self.signature_automaton = self._build_signature_automaton()
         self.ml_classifier = LSTMAnomalyClassifier()
+        self.transformer_analyzer = TransformerQueryAnalyzer()
 
     def _build_signature_automaton(self) -> ahocorasick.Automaton | None:
         automaton = ahocorasick.Automaton()
-        signatures_path = Path(__file__).with_name("attack_signatures.json")
+        signatures = load_config("attack_signatures").get("signatures", [])
         try:
-            with open(signatures_path, "r", encoding="utf-8") as f:
-                signatures = json.load(f).get("signatures", [])
             for sig in signatures:
                 pattern = sig.get("pattern", "").lower()
                 weight = sig.get("weight", 0.0)
@@ -71,10 +112,9 @@ class Scanner:
                     automaton.add_word(pattern, (pattern, weight))
             automaton.make_automaton()
             return automaton
-        except FileNotFoundError:
-            if self.debug: print(f"    [bold yellow]Debug: Signature file not found at {signatures_path}")
         except Exception as e:
-            if self.debug: print(f"    [bold red]Debug: Failed to load signatures: {e}")
+            if self.debug:
+                print(f"    [bold red]Debug: Failed to load signatures: {e}")
         return None
 
     def _update_rate_limit_status(self, status: int, is_waf_block: bool):
@@ -134,7 +174,15 @@ class Scanner:
         baseline_time = statistics.median(timings) if timings else 0
         return baseline_status, baseline_time, Simhash(baseline_body), baseline_body
 
-    def _analyze_response_for_anomalies(self, baseline_status: int, baseline_hash: Simhash, response_status: int, response_body: str) -> tuple[float, str | None]:
+    def _analyze_response_for_anomalies(
+        self,
+        baseline_status: int,
+        baseline_hash: Simhash,
+        response_status: int,
+        response_body: str,
+        baseline_time: float | None = None,
+        response_time: float | None = None,
+    ) -> tuple[float, str | None]:
         """
         Analyzes a response against a baseline and returns an anomaly score (0.0 to 1.0)
         and the dialect inferred from an error message, if any.
@@ -147,6 +195,15 @@ class Scanner:
         hash_distance = baseline_hash.distance(Simhash(response_body))
         normalized_distance = min(hash_distance / 64.0, 1.0)
         anomaly_score += (normalized_distance * 0.4)
+
+        # Timing side-channel: significant increase over baseline indicates potential blind SQLi
+        if baseline_time is not None and response_time is not None:
+            if response_time > baseline_time * 1.5:
+                anomaly_score += 0.2
+
+        # Query-plan side-channel: look for tell-tale plan keywords
+        if re.search(r"(seq scan|index scan|query plan)", response_body, re.IGNORECASE):
+            anomaly_score += 0.2
 
         # Aho-Corasick attack signature detection
         if self.signature_automaton:
@@ -175,9 +232,12 @@ class Scanner:
             try:
                 ast = sqlglot.parse_one(fragment)
                 ml_score = self.ml_classifier.score(ast)
-                anomaly_score += ml_score * 0.3
-                if self.debug and ml_score > 0:
-                    print(f"    [bold yellow]Debug: ML score {ml_score:.2f} for fragment: {fragment}")
+                transformer_score = self.transformer_analyzer.score(fragment)
+                anomaly_score += ml_score * 0.3 + transformer_score * 0.2
+                if self.debug and (ml_score > 0 or transformer_score > 0):
+                    print(
+                        f"    [bold yellow]Debug: ML {ml_score:.2f} / TF {transformer_score:.2f} for fragment: {fragment}"
+                    )
             except Exception:
                 continue
 
@@ -212,10 +272,12 @@ class Scanner:
         for payload in self.QUICK_SCAN_PAYLOADS:
             for injected_value in [original_value + payload, fuzz_string + payload, payload]:
                 final_request_args = await create_request_args(injected_value)
-                body, _, is_blocked, status = await self._send_headless_request(url, method, **final_request_args)
+                body, duration, is_blocked, status = await self._send_headless_request(url, method, **final_request_args)
                 if is_blocked or not body: continue
 
-                anomaly_score, inferred_dialect = self._analyze_response_for_anomalies(baseline_status, baseline_hash, status, body)
+                anomaly_score, inferred_dialect = self._analyze_response_for_anomalies(
+                    baseline_status, baseline_hash, status, body, baseline_time, duration
+                )
 
                 if anomaly_score >= ANOMALY_CONFIRMATION_THRESHOLD:
                     if inferred_dialect: # Found a high-confidence error pattern

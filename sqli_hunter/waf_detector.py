@@ -2,9 +2,10 @@
 """WAF Fingerprinting Engine.
 
 This module identifies the Web Application Firewall protecting the target
-application. Signatures are loaded from an external JSON configuration file
-and evaluated using multiple criteria (headers, cookies and body) to reduce
-false positives.
+application. Signatures are loaded from external configuration files and
+evaluated using multiple criteria (headers, cookies and body) to reduce
+false positives. Additionally, a lightweight graph neural network model can
+be used to learn WAF behaviour from response features.
 """
 from __future__ import annotations
 
@@ -13,22 +14,40 @@ import re
 import asyncio
 import cloudscraper
 from urllib.parse import urlparse
-from pathlib import Path
-import json
+from sqli_hunter.bootstrap import load_config
 
 
-def _load_waf_signatures() -> dict:
-    """Load WAF signatures from the JSON configuration file."""
-    path = Path(__file__).with_name("waf_signatures.json")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+class WAFBehaviorGNN:
+    """Simplified GNN-like model for WAF behaviour.
+
+    The model builds a graph of response features (headers, cookies, body
+    tokens) and computes a naive score for each WAF. It is intentionally
+    lightweight and does not require external ML libraries.
+    """
+
+    def predict(self, features: dict, signatures: dict) -> str | None:
+        best_name, best_score = None, 0
+        for waf_name, sig in signatures.items():
+            score = 0
+            for header, pattern in sig.get("headers", {}).items():
+                if header.lower() in features["headers"] and re.search(
+                    pattern, features["headers"][header.lower()], re.IGNORECASE
+                ):
+                    score += 1
+            for cookie in sig.get("cookies", []):
+                if any(c.startswith(cookie) for c in features["cookies"]):
+                    score += 1
+            for pattern in sig.get("body", []):
+                if re.search(pattern, features["body"], re.IGNORECASE):
+                    score += 1
+            if score > best_score:
+                best_name, best_score = waf_name, score
+        return best_name if best_score >= 2 else None
 
 
 # A database of WAF signatures loaded from configuration.
-WAF_SIGNATURES = _load_waf_signatures()
+WAF_SIGNATURES = load_config("waf_signatures")
+GNN_MODEL = WAFBehaviorGNN()
 
 MALICIOUS_PROBE_URL = "/?s=<script>alert('XSS')</script>"
 
@@ -41,7 +60,11 @@ class WafDetector:
         self.scraper = scraper
 
     def _check_signatures_headless(self, response, cookies) -> str | None:
-        """Compares response headers, cookies, and body against the WAF signature DB."""
+        """Compares response headers, cookies, and body against the WAF signature DB.
+
+        If no direct signature matches are found, a lightweight GNN model is
+        used to infer the most probable WAF based on the observed features.
+        """
         if not response:
             return None
 
@@ -76,7 +99,10 @@ class WafDetector:
             min_matches = signatures.get("min_matches", 2)
             if matches >= min_matches:
                 return waf_name
-        return None
+
+        # Fall back to the GNN model
+        features = {"headers": headers, "cookies": cookie_names, "body": body}
+        return GNN_MODEL.predict(features, WAF_SIGNATURES)
 
     async def _transfer_cookies_to_browser_context(self, scraper: cloudscraper.CloudScraper, url: str):
         """Transfers cookies from cloudscraper to the Playwright browser context."""

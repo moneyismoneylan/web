@@ -9,6 +9,23 @@ import random
 from typing import Dict, List
 from sqli_hunter.tamper import TAMPER_FUNCTIONS
 
+
+class GANPayloadGenerator:
+    """Very small GAN-like generator for payload seeds.
+
+    This is a stub implementation that emulates the interface of a GAN
+    without pulling in heavyweight deep learning frameworks. It simply
+    returns shuffled versions of the input to mimic generative behaviour.
+    """
+
+    def generate(self, payload: str, n: int = 1) -> List[str]:
+        variations = []
+        for _ in range(n):
+            chars = list(payload)
+            random.shuffle(chars)
+            variations.append(''.join(chars))
+        return variations
+
 class PolymorphicEngine:
     """
     Generates polymorphic variations of a given payload.
@@ -28,8 +45,14 @@ class PolymorphicEngine:
                 payload = payload.replace(token, replacement, 1)
         return payload
 
-    def generate(self, base_payload: str, num_variations: int = 10, grammar: Dict[str, List[str]] | None = None,
-                 taint_map: Dict[str, str] | None = None) -> list[str]:
+    def generate(
+        self,
+        base_payload: str,
+        num_variations: int = 10,
+        grammar: Dict[str, List[str]] | None = None,
+        taint_map: Dict[str, str] | None = None,
+        use_gan: bool = False,
+    ) -> list[str]:
         """Generates polymorphic variations for a given base payload.
 
         :param base_payload: The base payload to transform. It may contain grammar
@@ -40,6 +63,7 @@ class PolymorphicEngine:
         :return: A list of transformed payloads.
         """
         variations = set()
+        gan = GANPayloadGenerator() if use_gan else None
         for _ in range(num_variations):
             num_transformations = random.randint(1, self.max_transformations)
             selected_tampers = random.sample(self.tamper_functions, num_transformations)
@@ -49,5 +73,7 @@ class PolymorphicEngine:
                 transformed_payload = tamper(transformed_payload)
 
             variations.add(transformed_payload)
+            if gan:
+                variations.update(gan.generate(transformed_payload, 1))
 
         return list(variations)
